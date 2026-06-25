@@ -372,6 +372,19 @@ canvas { display:block; }
 
 /* --- interactive Gantt (scroll/zoom/scale) --- */
 .g2-toolbar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+
+.race-wrap{ position:relative; padding:6px 0; }
+.race-head{ position:relative; height:20px; margin:0 0 8px 132px; }
+.race-head .st{ position:absolute; transform:translateX(-50%); font-size:9.5px; color:var(--ink-3); white-space:nowrap; }
+.race-row{ display:flex; align-items:center; gap:10px; margin:6px 0; }
+.race-name{ width:122px; flex:none; font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--ink-2); }
+.race-track{ position:relative; flex:1; height:28px; background:var(--panel-2); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.race-track .tick{ position:absolute; top:0; bottom:0; width:1px; background:var(--line); opacity:.8; }
+.race-fill{ position:absolute; top:0; bottom:0; left:0; background:var(--accent); opacity:.14; }
+.race-finish{ position:absolute; right:0; top:0; bottom:0; width:5px; background:repeating-linear-gradient(45deg,var(--ink-3),var(--ink-3) 3px,transparent 3px,transparent 6px); opacity:.6; }
+.runner{ position:absolute; top:50%; transform:translate(-50%,-50%); background:var(--accent); color:#04121f; font-size:10px; font-weight:700; padding:3px 8px; border-radius:12px; white-space:nowrap; box-shadow:0 1px 5px rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.25); z-index:2; }
+.runner.done{ background:var(--green); } .runner.behind{ background:var(--red); color:#fff; } .runner.idle{ background:var(--line-2); color:var(--ink-2); box-shadow:none; }
+@media (max-width:760px){ .race-head{ margin-left:84px; } .race-name{ width:74px; } .runner{ font-size:9px; padding:2px 6px; } }
 .g2-seg { display:inline-flex; border:1px solid var(--line-2); border-radius:8px; overflow:hidden; }
 .g2-seg button { border:0; background:var(--panel-2); color:var(--ink-2); padding:6px 12px; font-size:11.5px; cursor:pointer; font-weight:600; letter-spacing:.02em; }
 .g2-seg button + button { border-left:1px solid var(--line-2); }
@@ -528,6 +541,7 @@ const ICONS = {
   pause:'<rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/>',
   lock:'<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
   menu:'<path d="M3 6h18M3 12h18M3 18h18"/>',
+  flag:'<path d="M5 21V4M5 4h12l-2 3.5L17 11H5"/>',
   eye:'<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/>'
 };
 function icon(name, cls){ return `<svg class="${cls||"ico"}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]||""}</svg>`; }
@@ -552,8 +566,8 @@ const State = {
   settings:{ userLabel:"Planner", theme:"dark", hoursPerDay:8, projectStartMs:null,
              companyName:"AeroPlan Pro", logoText:"APP", logoDataUrl:null },
   ui:{ module:"dashboard", activeProgram:null, activeAircraft:null, activeStage:null,
-       taskFilter:"", lastConflicts:[], collapsedStages:{}, ganttCriticalOnly:false,
-       checkinTech:null, checkinAircraft:null, checkinTask:null }
+       taskFilter:"", lastConflicts:[], collapsedStages:{}, ganttCriticalOnly:false, ganttShowActual:true,
+       checkinTech:null, checkinAircraft:null, checkinTask:null, checkinWorkers:1 }
 };
 
 /* ------------------------------------------------------------------ */
@@ -694,7 +708,7 @@ function seedIfEmpty(){
 
   // Program
   const prog={ id:uid("prog"), code:"TACTICAL-UAV", name:"Tactical UAV", description:"Composite tactical UAV production program.",
-    status:"ACTIVE", aircraftIds:[], defaultCalendarId:cal.id, activeBaselineId:null, stageGating:false, createdAtMs:Date.now() };
+    status:"ACTIVE", aircraftIds:[], defaultCalendarId:cal.id, activeBaselineId:null, stageGating:false, lineMode:"off", lineScope:"program", createdAtMs:Date.now() };
   State.programs.push(prog);
   State.ui.activeProgram=prog.id;
 
@@ -1026,14 +1040,27 @@ const Engine = (function(){
     // Stage gating (decision): when ON, a stage starts only after every task in earlier stages of the same aircraft is released.
     const program=byId(State.programs,programId); const gating=!!(program&&program.stageGating);
     const stInfo={}; tasks.forEach(t=>{ const st=byId(State.stages,t.stageId); stInfo[t.id]={ac: st?st.aircraftId:null, seq: st?st.sequence:0, tseq: t.seq||0, gated: st?!!st.gated:false}; });
+    // Production-line gating across aircraft (serial / pulse). Stations = stages.
+    const lineMode=(program&&program.lineMode)||"off"; const lineScope=(program&&program.lineScope)||"program";
+    const acListP=State.aircraft.filter(a=>a.programId===programId);
+    const grpOf=(acId)=>{ const a=byId(State.aircraft,acId); if(!a) return "ALL"; return lineScope==="model"? ("M:"+(a.model||"")) : "ALL"; };
+    const _grp={}; acListP.forEach(a=>{ const g=grpOf(a.id); (_grp[g]=_grp[g]||[]).push(a); });
+    const buildIdx={}; Object.keys(_grp).forEach(g=>{ _grp[g].slice().sort((x,y)=> ((x.buildSeq||0)-(y.buildSeq||0)) || ((x.plannedStartMs||0)-(y.plannedStartMs||0)) || String(x.serialNumber||"").localeCompare(String(y.serialNumber||""),undefined,{numeric:true})).forEach((a,i)=>buildIdx[a.id]=i); });
+    tasks.forEach(t=>{ const inf=stInfo[t.id]; if(inf){ inf.grp= inf.ac!=null? grpOf(inf.ac):"ALL"; inf.bi= inf.ac!=null? (buildIdx[inf.ac]||0):0; } });
     const stageMax={}; // aircraftId -> { stageSeq -> max release(finish)Ms }
     const order=[...c.order].sort((a,b)=>{
       const A=stInfo[a]||{}, B=stInfo[b]||{};
-      // Authored production order: stage sequence, then task sequence (per aircraft).
-      if(A.ac===B.ac){ if(A.seq!==B.seq) return A.seq-B.seq; if(A.tseq!==B.tseq) return (A.tseq||0)-(B.tseq||0); }
+      if(lineMode!=="off"){
+        // Flow line: process tail-by-tail (build order) within each scope group, in station order.
+        if((A.grp||"")!==(B.grp||"")) return (A.grp||"")<(B.grp||"")?-1:1;
+        if((A.bi||0)!==(B.bi||0)) return (A.bi||0)-(B.bi||0);
+        if(A.seq!==B.seq) return A.seq-B.seq;
+        if((A.tseq||0)!==(B.tseq||0)) return (A.tseq||0)-(B.tseq||0);
+      } else if(A.ac===B.ac){ if(A.seq!==B.seq) return A.seq-B.seq; if(A.tseq!==B.tseq) return (A.tseq||0)-(B.tseq||0); }
       const ca=c.cpm[a]||{floatMin:1e9}, cb=c.cpm[b]||{floatMin:1e9};
       if(ca.floatMin!==cb.floatMin) return ca.floatMin-cb.floatMin;
       const ta=byId(tasks,a)||{priority:0}, tb=byId(tasks,b)||{priority:0}; return (tb.priority||0)-(ta.priority||0); });
+    const lineState={};
 
     // Each aircraft begins no earlier than its planned-window start date (falls back to the program/project start).
     function acStartFor(id){ const acId=stInfo[id]&&stInfo[id].ac; const ac=acId?byId(State.aircraft,acId):null; return (ac&&ac.plannedStartMs)? ac.plannedStartMs : base; }
@@ -1050,6 +1077,12 @@ const Engine = (function(){
       { const inf=stInfo[id]; const gateThis= gating || (inf&&inf.gated);
         if(gateThis && inf && inf.ac!=null){ const sm=stageMax[inf.ac]||{};
           Object.keys(sm).forEach(k=>{ if(+k<inf.seq) eps=Math.max(eps, sm[k]); }); } }
+      if(lineMode!=="off"){ const inf=stInfo[id]; const g=inf.grp||"ALL"; let ls=lineState[g];
+        if(!ls){ ls={curBi:inf.bi,prevAcFinish:0,prevStationRelease:{},curStationRelease:{}}; lineState[g]=ls; }
+        if(inf.bi!==ls.curBi){ let mx=0; for(const k in ls.curStationRelease) mx=Math.max(mx,ls.curStationRelease[k]);
+          ls.prevAcFinish=mx; ls.prevStationRelease=ls.curStationRelease; ls.curStationRelease={}; ls.curBi=inf.bi; }
+        if(inf.bi>0){ if(lineMode==="serial") eps=Math.max(eps, ls.prevAcFinish||0);
+          else if(lineMode==="pulse") eps=Math.max(eps, ls.prevStationRelease[inf.seq]||0); } }
       eps=WorkCal.nextWorkingStart(cal, Math.max(eps,acFloor));
 
       const baseL=layout(t,P,eps); const baseB=bookings(t,P,baseL);
@@ -1069,6 +1102,7 @@ const Engine = (function(){
       workStartMs[id]=cl.workStart; finishMs[id]=cl.coolEnd; placed[id]=true;
       { const inf=stInfo[id]; if(inf && inf.ac!=null){ (stageMax[inf.ac]=stageMax[inf.ac]||{});
         stageMax[inf.ac][inf.seq]=Math.max(stageMax[inf.ac][inf.seq]||0, cl.coolEnd); } }
+      if(lineMode!=="off"){ const inf=stInfo[id]; const ls=lineState[inf.grp||"ALL"]; if(ls){ ls.curStationRelease[inf.seq]=Math.max(ls.curStationRelease[inf.seq]||0, cl.coolEnd); } }
       const cc=c.cpm[id]; const floatMs=cc.floatMin*MIN;
       taskSchedules.push({ taskId:id, startMs:cl.workStart, finishMs:cl.coolEnd,
         workEndMs:cl.workEnd, cureEndMs:cl.cureEnd, coolEndMs:cl.coolEnd,
@@ -1544,15 +1578,32 @@ const Gantt2 = (function(){
           ctx.fillStyle=cv("--accent"); ctx.globalAlpha=.6; ctx.fillRect(a,y+7,2.5,ROWH-14); ctx.fillRect(b-2.5,y+7,2.5,ROWH-14); ctx.globalAlpha=1; }
         return; }
       if(i%2===1){ ctx.fillStyle=cv("--panel-2"); ctx.globalAlpha=.4; ctx.fillRect(0,y,W,ROWH); ctx.globalAlpha=1; }
-      const by=y+5, bh=ROWH-12; const {bx,wEnd,cEnd,kEnd}=barX(r);
+      const {bx,wEnd,cEnd,kEnd}=barX(r);
+      const hasA= cur.showActual && r.hasActual;
+      const by= hasA? y+4 : y+6, bh= hasA? 9 : (ROWH-13);
       const accent= r.critical? cv("--red") : (r.done? cv("--green") : cv("--accent"));
       ctx.fillStyle=accent; rr(ctx,bx,by,Math.max(2,wEnd-bx),bh,3); ctx.fill();
       if(cEnd>wEnd){ ctx.fillStyle=cv("--orange"); ctx.globalAlpha=.9; ctx.fillRect(wEnd,by,cEnd-wEnd,bh); ctx.globalAlpha=1; }
       if(kEnd>cEnd){ ctx.fillStyle=cv("--amber"); ctx.globalAlpha=.55; ctx.fillRect(cEnd,by,kEnd-cEnd,bh); ctx.globalAlpha=1; }
       ctx.strokeStyle=cv("--bg"); ctx.lineWidth=1; ctx.strokeRect(bx,by,Math.max(2,kEnd-bx),bh);
       const procMin=(r.workMin||0)+(r.cureMin||0)+(r.coolMin||0);
-      const lbl= procMin>0? hrLabel(procMin) : hrLabel((r.finishMs-r.startMs)/MIN);
-      if(kEnd+40<W){ ctx.fillStyle=cv("--ink-3"); ctx.font="9.5px monospace"; ctx.fillText(lbl,kEnd+5,y+ROWH/2+4); } });
+      let labelEnd=kEnd;
+      if(hasA){
+        const ay=y+ROWH-7, ah=4.4; const plannedPx=Math.max(2,kEnd-bx);
+        const ratio=clamp(r.actRatio||0,0,2.8); const aw=Math.max(2,plannedPx*ratio);
+        ctx.strokeStyle=cv("--line-2"); ctx.setLineDash([2,2]); ctx.strokeRect(bx+0.5,ay+0.5,plannedPx-1,ah-1); ctx.setLineDash([]);
+        const acol= r.done? (r.actLate? cv("--red") : cv("--green")) : cv("--amber");
+        ctx.fillStyle=acol; rr(ctx,bx,ay,aw,ah,2); ctx.fill();
+        labelEnd=Math.max(kEnd,bx+aw);
+      }
+      const baseLbl= procMin>0? hrLabel(procMin) : hrLabel((r.finishMs-r.startMs)/MIN);
+      if(labelEnd+46<W){ ctx.font="9.5px monospace";
+        ctx.fillStyle=cv("--ink-3"); ctx.fillText(baseLbl,labelEnd+5,y+ROWH/2+3.5);
+        if(hasA){ const lw=ctx.measureText(baseLbl).width; let sfx="",scol=cv("--ink-3");
+          if(r.done){ if(r.actLate){ sfx=" \u25B2+"+r.deltaH+"h"; scol=cv("--red"); } else { sfx=" \u2713"+(r.deltaH<0?r.deltaH+"h":""); scol=cv("--green"); } }
+          else { sfx=" \u00b7 "+r.pct+"%"; scol=cv("--amber"); }
+          ctx.fillStyle=scol; ctx.fillText(sfx,labelEnd+5+lw,y+ROWH/2+3.5); }
+      } });
     if(now>=cur.t0&&now<=cur.t1){ const x=xOf(now); ctx.strokeStyle=cv("--accent"); ctx.lineWidth=1.5; ctx.setLineDash([4,3]); ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); ctx.setLineDash([]); ctx.lineWidth=1; } }
 
   function drawLabels(ctx){ if(!ctx) return; const H=cur.rowsH;
@@ -1576,6 +1627,7 @@ const Gantt2 = (function(){
     const work=hrLabel(r.workMin||0), cure=(r.cureMin||0)>0?" \u00b7 Cure "+hrLabel(r.cureMin):"", cool=(r.coolMin||0)>0?" \u00b7 Cool "+hrLabel(r.coolMin):"";
     tip.innerHTML="<b>"+esc(r.label)+"</b><div class='tl'>"+(r.stage?esc(r.stage)+"<br>":"")+"Start: "+fmtDateTime(r.startMs)+"<br>Finish: "+fmtDateTime(r.finishMs)+
       "<br><span style='color:var(--accent)'>Work "+work+"</span>"+cure+cool+
+      (r.hasActual? "<br><span style='color:"+(r.done?(r.actLate?"var(--red)":"var(--green)"):"var(--amber)")+"'>Actual "+hrLabel(r.actMin||0)+" \u00b7 "+(r.done?(r.actLate?"late +"+r.deltaH+"h":(r.deltaH<0?(-r.deltaH)+"h early":"on time")):r.pct+"% done")+"</span>" : "<br><span style='color:var(--ink-3)'>Not started</span>")+
       ((r.preds&&r.preds.length)? "<br>After: "+r.preds.map(esc).join("<br>&nbsp;&nbsp;") : "<br><span style='color:var(--ink-3)'>Parallel (no predecessor)</span>")+
       (r.critical?"<br><span style='color:var(--red)'>On critical path</span>":"")+"</div>"; }
   function onClick(ev,canvas){ const idx=rowAt(ev,canvas); if(idx<0) return; const r=cur.rows[idx];
@@ -1594,10 +1646,11 @@ const Gantt2 = (function(){
     const visH=Math.min(rowsH,MAXBODYH); cur.els.labelsvp.style.height=visH+"px"; cur.els.body.style.height=visH+"px";
     drawAxis(setup(cur.els.axis,tw,AXISH)); drawLabels(setup(cur.els.labels,LABELW,rowsH)); drawBody(setup(cur.els.time,tw,rowsH)); updateToolbar(); }
   function updateToolbar(){ document.querySelectorAll('[data-act="gantt-scale"]').forEach(b=>b.classList.toggle("active",b.dataset.scale===cur.scale));
-    document.querySelectorAll('[data-act="gantt-worktime"]').forEach(b=>b.classList.toggle("active",!!cur.workTime)); }
+    document.querySelectorAll('[data-act="gantt-worktime"]').forEach(b=>b.classList.toggle("active",!!cur.workTime));
+    document.querySelectorAll('[data-act="gantt-actual"]').forEach(b=>b.classList.toggle("active",!!cur.showActual)); }
 
   function build(host, rows, opts){ if(!host) return;
-    cur={ host, rows:rows||[], calId:(opts&&opts.calId), scale:(State.ui.ganttScale||"day"), zoom:(State.ui.ganttZoom||1), workTime:(State.ui.ganttWorkTime!==false) };
+    cur={ host, rows:rows||[], calId:(opts&&opts.calId), scale:(State.ui.ganttScale||"day"), zoom:(State.ui.ganttZoom||1), workTime:(State.ui.ganttWorkTime!==false), showActual:(State.ui.ganttShowActual!==false) };
     cur.cal= cur.calId!=null? WorkCal.get(cur.calId): null;
     host.innerHTML='<div class="g2-head"><div class="g2-corner"></div><div class="g2-axisvp"><canvas class="g2-axis"></canvas></div></div>'+
       '<div class="g2-main"><div class="g2-labelsvp"><canvas class="g2-labels"></canvas></div>'+
@@ -1665,7 +1718,7 @@ const Gantt2 = (function(){
     const sMin=Math.min(...taskRows.map(r=>r.startMs)), fMax=Math.max(...taskRows.map(r=>r.finishMs));
     const title=(State.settings.companyName||"AeroPlan Pro");
     const w=window.open("","_blank"); if(!w){ toast("Allow pop-ups to print the Gantt"); return; }
-    const legend='<span><i style="background:#38bdf8"></i>Work</span><span><i style="background:#fb923c"></i>Cure</span><span><i style="background:#fbbf24"></i>Cool</span><span><i style="background:#f43f5e"></i>Critical path</span><span><i style="background:#34d399"></i>Complete</span>';
+    const legend='<span><i style="background:#38bdf8"></i>Work</span><span><i style="background:#fb923c"></i>Cure</span><span><i style="background:#fbbf24"></i>Cool</span><span><i style="background:#f43f5e"></i>Critical path</span><span><i style="background:#34d399"></i>Complete</span><span><i style="border:1px dashed #94a3b8"></i>Planned len</span><span><i style="background:#fbbf24"></i>Actual / % done</span>';
     let html='<html><head><title>'+esc(title)+' \u2014 Production Schedule</title><style>'+
       '@page{size:landscape;margin:9mm;}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;color:#15202b}'+
       '.cover{border-bottom:2px solid #38bdf8;padding-bottom:9px;margin-bottom:11px}.cover h1{font-size:18px;margin:0;letter-spacing:.3px}'+
@@ -1696,7 +1749,110 @@ const Gantt2 = (function(){
     out.toBlob? out.toBlob(b=>{ const url=URL.createObjectURL(b); const a=document.createElement("a"); a.href=url; a.download=fn; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000); toast("Gantt exported as PNG"); })
       : (()=>{ const a=document.createElement("a"); a.href=out.toDataURL("image/png"); a.download=fn; a.click(); toast("Gantt exported as PNG"); })(); }
 
-  return { build, setScale, setZoom, fit, gotoToday, toggleWorkTime, printChart, exportPNG, _cur:()=>cur };
+  function printOpsBoard(opts){ opts=opts||{};
+    if(!cur||!cur.rows.length){ toast("Nothing to print yet \u2014 run the schedule first"); return; }
+    const tasks=cur.rows.filter(r=>!r.isGroup && r.startMs!=null && r.finishMs!=null);
+    if(!tasks.length){ toast("No scheduled tasks to print"); return; }
+    const layout= opts.layout==="continuous"?"continuous":"daily";
+    const paper= opts.paper||"a4";
+    const cal=cur.cal; let dayStartMin=8*60, dayEndMin=17*60;
+    if(cal && cal.shifts && cal.shifts.length){ dayStartMin=Math.min.apply(null,cal.shifts.map(s=>s.startMin)); dayEndMin=Math.max.apply(null,cal.shifts.map(s=>s.endMin)); }
+    if(!(dayEndMin>dayStartMin)){ dayStartMin=8*60; dayEndMin=17*60; }
+    const SLOT=30; const slotMins=[]; for(let m=dayStartMin;m<dayEndMin;m+=SLOT) slotMins.push(m);
+    function hm(min){ min=((min%1440)+1440)%1440; const h=Math.floor(min/60), m=min%60; return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0"); }
+    function hmAt(ms){ const d=new Date(ms); return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
+    function dayMid(ms){ const d=new Date(ms); d.setHours(0,0,0,0); return d.getTime(); }
+    function phaseAt(t,cs,ce){
+      if(t.startMs<ce && (t.workEndMs!=null?t.workEndMs:t.finishMs)>cs) return "work";
+      if(t.workEndMs!=null && t.cureEndMs!=null && t.cureEndMs>t.workEndMs && t.workEndMs<ce && t.cureEndMs>cs) return "cure";
+      if(t.cureEndMs!=null && t.finishMs>t.cureEndMs && t.cureEndMs<ce && t.finishMs>cs) return "cool";
+      return null;
+    }
+    function cellFor(t,cs){ const ce=cs+SLOT*MIN; const ph=phaseAt(t,cs,ce);
+      if(ph==="work") return '<td class="slot work"><span class="ck"></span></td>';
+      if(ph==="cure") return '<td class="slot cure"></td>';
+      if(ph==="cool") return '<td class="slot cool"></td>';
+      return '<td class="slot"></td>'; }
+    function groupByStage(list){ const by={}, order=[]; list.slice().sort((a,b)=>a.startMs-b.startMs||String(a.wbs).localeCompare(String(b.wbs),undefined,{numeric:true}))
+        .forEach(t=>{ const sg=t.stage||"Tasks"; if(!by[sg]){ by[sg]=[]; order.push(sg);} by[sg].push(t); }); return {by,order}; }
+
+    const sMin=Math.min.apply(null,tasks.map(t=>t.startMs)), fMax=Math.max.apply(null,tasks.map(t=>t.finishMs));
+    const d0=dayMid(sMin), dEnd=dayMid(fMax);
+    const ap=activeProgram&&activeProgram(); const acName=(State.ui.activeAircraft&&byId(State.aircraft,State.ui.activeAircraft))? byId(State.aircraft,State.ui.activeAircraft).serialNumber:"";
+    const title=(State.settings.companyName||"AeroPlan Pro");
+    const dfmt=(ms)=>new Date(ms).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"});
+
+    let inner="", rangeNote="";
+    if(layout==="daily"){
+      const MAXDAYS=60; const days=[];
+      for(let d=d0; d<=dEnd && days.length<MAXDAYS; d+=DAY){ const wStart=d+dayStartMin*MIN, wEnd=d+dayEndMin*MIN;
+        const active=tasks.filter(t=>t.startMs<wEnd && t.finishMs>wStart); if(active.length) days.push({d,active}); }
+      if(!days.length){ toast("No working-hour activity to board"); return; }
+      const slotHdr=slotMins.map(m=>'<th class="slot'+(m%60===0?' hr':'')+'">'+hm(m)+'</th>').join("");
+      days.forEach((day,di)=>{
+        const dlabel=new Date(day.d).toLocaleDateString(undefined,{weekday:"long",year:"numeric",month:"short",day:"numeric"});
+        const g=groupByStage(day.active); let body="";
+        g.order.forEach(sg=>{ body+='<tr class="stg"><td colspan="4">'+esc(sg)+'</td>'+slotMins.map(()=>'<td class="slot"></td>').join("")+'<td></td><td></td></tr>';
+          g.by[sg].forEach(t=>{ const cells=slotMins.map(m=>cellFor(t,day.d+m*MIN)).join("");
+            const win=hmAt(t.startMs)+"\u2013"+hmAt(t.finishMs); const nm=(t.critical?'\u25C6 ':'')+esc(t.label);
+            body+='<tr'+(t.critical?' class="crit"':'')+'><td class="wbs">'+esc(t.wbs||"")+'</td><td class="nm">'+nm+'</td><td class="c">'+(t.crew||"")+'</td><td class="c win">'+win+'</td>'+cells+'<td class="pct">'+(t.pct?('<s>'+t.pct+'%</s>'):'')+'</td><td class="sign"></td></tr>'; }); });
+        inner+='<div class="page'+(di<days.length-1?' brk':'')+'"><div class="dhd"><span class="dn">'+esc(dlabel)+'</span> \u2014 '+esc(ap?ap.name:"")+(acName?" \u00b7 "+esc(acName):"")+' \u00b7 day '+(di+1)+' of '+days.length+'</div>'+
+          '<table class="board"><thead><tr><th class="wbs">WBS</th><th class="nm">Task</th><th class="c">Crew</th><th class="c">Plan</th>'+slotHdr+'<th class="pct">% done</th><th class="sign">Init</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+      });
+      rangeNote=days.length+" working day(s) \u00b7 "+hm(dayStartMin)+"\u2013"+hm(dayEndMin);
+    } else {
+      // continuous long-format: one wide table across all working days
+      const MAXCOLS=720; const cols=[];
+      for(let d=d0; d<=dEnd; d+=DAY){ const wStart=d+dayStartMin*MIN, wEnd=d+dayEndMin*MIN;
+        if(!tasks.some(t=>t.startMs<wEnd && t.finishMs>wStart)) continue;
+        slotMins.forEach((m,i)=>{ if(cols.length<MAXCOLS) cols.push({ms:d+m*MIN, min:m, dayStart:i===0, day:d}); }); }
+      if(!cols.length){ toast("No working-hour activity to board"); return; }
+      const truncated= cols.length>=MAXCOLS;
+      // day header row (group columns per day)
+      let dayHdr=""; let i=0; while(i<cols.length){ let j=i; while(j<cols.length && cols[j].day===cols[i].day) j++; dayHdr+='<th class="dayh" colspan="'+(j-i)+'">'+dfmt(cols[i].day)+'</th>'; i=j; }
+      const timeHdr=cols.map(c=>'<th class="slot'+(c.min%60===0?' hr':'')+(c.dayStart?' dsep':'')+'">'+hm(c.min)+'</th>').join("");
+      const winTasks=tasks.filter(t=>t.startMs<cols[cols.length-1].ms+SLOT*MIN && t.finishMs>cols[0].ms);
+      const g=groupByStage(winTasks); let body="";
+      g.order.forEach(sg=>{ body+='<tr class="stg"><td colspan="3">'+esc(sg)+'</td>'+cols.map(c=>'<td class="slot'+(c.dayStart?' dsep':'')+'"></td>').join("")+'<td></td><td></td></tr>';
+        g.by[sg].forEach(t=>{ const cells=cols.map(c=>{ let cell=cellFor(t,c.ms); if(c.dayStart) cell=cell.replace('class="slot','class="slot dsep'); return cell; }).join("");
+          const nm=(t.critical?'\u25C6 ':'')+esc(t.label);
+          body+='<tr'+(t.critical?' class="crit"':'')+'><td class="wbs">'+esc(t.wbs||"")+'</td><td class="nm">'+nm+'</td><td class="c">'+(t.crew||"")+'</td>'+cells+'<td class="pct">'+(t.pct?('<s>'+t.pct+'%</s>'):'')+'</td><td class="sign"></td></tr>'; }); });
+      inner='<div class="cont"><table class="board"><thead>'+
+        '<tr><th class="wbs" rowspan="2">WBS</th><th class="nm" rowspan="2">Task</th><th class="c" rowspan="2">Crew</th>'+dayHdr+'<th class="pct" rowspan="2">% done</th><th class="sign" rowspan="2">Init</th></tr>'+
+        '<tr>'+timeHdr+'</tr></thead><tbody>'+body+'</tbody></table></div>';
+      rangeNote=dfmt(cols[0].day)+" \u2192 "+dfmt(cols[cols.length-1].day)+" \u00b7 continuous "+hm(dayStartMin)+"\u2013"+hm(dayEndMin)+(truncated?" \u00b7 (truncated \u2014 filter to one aircraft)":"");
+    }
+
+    const pageCss = paper==="a3" ? "size:A3 landscape" : paper==="long" ? "size:1600mm 300mm" : "size:A4 landscape";
+    const w=window.open("","_blank"); if(!w){ toast("Allow pop-ups to print the board"); return; }
+    const css='@page{'+pageCss+';margin:8mm}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;color:#15202b}'+
+      '.brand{display:flex;align-items:baseline;gap:10px;border-bottom:2px solid #2563eb;padding-bottom:7px;margin-bottom:9px}'+
+      '.brand h1{font-size:15px;margin:0}.brand .tag{font-size:10px;color:#2563eb;font-weight:700;letter-spacing:.5px}.brand .s{font-size:10.5px;color:#5b6b7e;margin-left:auto}'+
+      '.legend{display:flex;gap:14px;font-size:10px;color:#46566a;margin:0 0 9px;flex-wrap:wrap}.legend i{display:inline-block;width:12px;height:11px;border:1px solid #cbd5e1;margin-right:4px;vertical-align:-1px}'+
+      '.legend .w{background:#dbeafe}.legend .cu{background:#ffedd5}.legend .co{background:#fef9c3}'+
+      '.page.brk{page-break-after:always}.dhd{font-size:11px;margin:8px 0 4px;color:#1f2d3d}.dhd .dn{font-weight:700}'+
+      '.cont{overflow:visible}'+
+      'table.board{border-collapse:collapse;width:100%;table-layout:fixed}'+
+      'th,td{border:1px solid #c2ccd8;font-size:8.5px;padding:1px 2px;overflow:hidden}'+
+      'th{background:#eef2f7;font-weight:700}th.dayh{background:#dbe3ee;font-size:8.5px;border-bottom:2px solid #94a3b8}'+
+      'th.slot,td.slot{width:21px;text-align:center;padding:0}'+
+      'th.slot{font-size:7px;writing-mode:vertical-rl;transform:rotate(180deg);height:32px}th.slot.hr{background:#dbe3ee;font-weight:700}'+
+      'td.slot.dsep,th.slot.dsep{border-left:2px solid #94a3b8}'+
+      'td.slot.work{background:#dbeafe}td.slot.cure{background:#ffedd5}td.slot.cool{background:#fef9c3}'+
+      '.ck{display:inline-block;width:9px;height:9px;border:1px solid #475569;border-radius:2px;margin-top:3px}'+
+      'td.wbs,th.wbs{width:32px}td.nm,th.nm{width:148px;text-align:left;white-space:nowrap;text-overflow:ellipsis}td.c,th.c{width:28px;text-align:center}td.win{font-size:7.5px;color:#475569}'+
+      'td.pct,th.pct{width:40px;text-align:center}td.sign,th.sign{width:38px}td.pct s{color:#94a3b8;text-decoration:none;font-size:7.5px}'+
+      'tr.stg td{background:#1f2d3d;color:#fff;font-weight:700;font-size:9px;padding:2px 4px}tr.crit td.nm{color:#dc2626;font-weight:700}tr{page-break-inside:avoid}';
+    const legend='<span><i class="w"></i>Work \u2014 tick \u25A1 each 30-min block done</span><span><i class="cu"></i>Cure (oven)</span><span><i class="co"></i>Cool (rack)</span><span>\u25C6 = critical path</span><span>Write running % in \u201c% done\u201d; initial when finished.</span>';
+    let html='<html><head><title>'+esc(title)+' \u2014 Ops Board</title><style>'+css+'</style></head><body>'+
+      '<div class="brand"><span class="tag">'+esc((State.settings.logoText||"APP").toUpperCase())+'</span><h1>Operations Board \u2014 30-min ('+(layout==="continuous"?"continuous":"daily")+')</h1>'+
+      '<span class="s">'+esc(ap?ap.name:"")+(acName?" \u00b7 "+esc(acName):"")+' \u00b7 '+rangeNote+' \u00b7 '+new Date().toLocaleDateString()+'</span></div>'+
+      '<div class="legend">'+legend+'</div>'+inner+
+      '<scr'+'ipt>window.onload=function(){setTimeout(function(){window.focus();window.print();},350);};</scr'+'ipt></body></html>';
+    w.document.open(); w.document.write(html); w.document.close();
+  }
+
+  return { build, setScale, setZoom, fit, gotoToday, toggleWorkTime, printChart, printOpsBoard, exportPNG, _cur:()=>cur };
 })();
 
 
@@ -1709,6 +1865,7 @@ const NAV=[
   {id:"programs",label:"Programs",icon:"program"},
   {id:"aircraft",label:"Aircraft",icon:"aircraft"},
   {id:"scheduling",label:"Scheduling",icon:"schedule"},
+  {id:"line",label:"Production Line",icon:"flag"},
   {id:"resources",label:"Resources",icon:"resource"},
   {id:"capacity",label:"Capacity",icon:"capacity"},
   {id:"efficiency",label:"Efficiency",icon:"trend"},
@@ -1730,6 +1887,7 @@ const VIEW_HELP={
   capacity:"<b>Daily loading vs available capacity</b>, derived from your Working Calendar. Allocated bars rising above the grey line flag an overload that day \u2014 add resources, enable overtime, or move work.",
   reports:"<b>Earned-value metrics &amp; one-click PDF reports</b> (with your company logo). Export tasks or resources to CSV for spreadsheets.",
   templates:"<b>Reusable blueprints.</b> Capture an aircraft\u2019s stage/task plan once, then apply it to other tails to avoid re-keying. <b>Duplicate</b> to branch a variant.",
+  line:"<b>Production line \u2014 the relay view.</b> See which aircraft is at which station and how far along each is. Turn on <b>line gating</b> to sequence tails: <b>Serial</b> finishes SN1 before SN2 starts; <b>Pulse</b> lets SN2 enter a station as soon as SN1 leaves it (a true flow line). Scope the line to the whole program or per model. Use \u25B2/\u25BC to set build order, then Recalculate.",
   checkin:"<b>Shop-floor time tracking.</b> Add technicians, then <b>check in</b> to a task to start a timer; <b>Check out</b> or <b>Complete</b> stops it and logs the time to the task\u2019s actual labor hours (feeding efficiency &amp; the learning curve). No QR needed \u2014 it works on any device. Optionally <b>Print QR labels</b> and, when online, <b>Scan QR</b> to check in by camera.",
   efficiency:"<b>Labor efficiency &amp; the serial-build learning curve.</b> <b>Required</b> efficiency is the productivity needed to fit each tail\u2019s work into its planned window; <b>achieved</b> is earned \u00f7 actual labor once you log progress. Record <b>Actual labor</b> &amp; <b>% complete</b> per task, then watch hours-per-unit fall across serial builds and read the fitted learning rate, projection &amp; analysis.",
   audit:"<b>Traceable change history.</b> Every create/update/delete is timestamped here, newest first \u2014 useful for AS9100-style records."
@@ -1745,6 +1903,7 @@ function render(){
     else if(m==="programs") html=viewPrograms();
     else if(m==="aircraft") html=viewAircraft();
     else if(m==="scheduling") html=viewScheduling();
+    else if(m==="line") html=viewLine();
     else if(m==="resources") html=viewResources();
     else if(m==="capacity") html=viewCapacity();
     else if(m==="efficiency") html=viewEfficiency();
@@ -2055,7 +2214,7 @@ function viewScheduling(){
     <div class="tabs">${acTabs||'<span class="muted">No aircraft</span>'}</div>
     ${effBand}
     <div class="split">
-      <div class="panel"><div class="panel-h"><span class="eyebrow">${stages.length} stages</span><h3>Task Tree</h3><span class="spacer"></span>${acFilter?`<button class="btn sm" data-act="collapse-all-stages" title="Collapse / expand all stages">${icon("layers","ico")} Collapse all</button> <button class="btn sm" data-act="add-stage" data-ac="${acFilter}">${icon("plus","ico")} Stage</button>`:""}</div>
+      <div class="panel"><div class="panel-h"><span class="eyebrow">${stages.length} stations</span><h3>Task Tree</h3><span class="spacer"></span>${acFilter?`<button class="btn sm" data-act="collapse-all-stages" title="Collapse / expand all stations">${icon("layers","ico")} Collapse all</button> <button class="btn sm" data-act="add-stage" data-ac="${acFilter}">${icon("plus","ico")} Station</button>`:""}</div>
         <div class="panel-b">${stages.length?tree:emptyState("layers","No stages","This aircraft has no stages yet.","")}</div></div>
       <div class="panel"><div class="panel-h"><span class="eyebrow">Timeline</span><h3>Gantt — Work · Cure · Cool</h3>
         <span class="spacer"></span><span class="muted mono" style="font-size:11px">${sched?fmtDate(sched.projectStartMs)+" → "+fmtDate(sched.projectFinishMs):""}</span></div>
@@ -2075,6 +2234,7 @@ function viewScheduling(){
             <button class="btn sm" data-act="gantt-today" title="Scroll to today">${icon("clock","ico")} Today</button>
             <button class="btn sm ${State.ui.ganttWorkTime!==false?'active':''}" data-act="gantt-worktime" title="Show only working hours — collapse nights, weekends &amp; holidays">${icon("clock","ico")} Work-time</button>
             <button class="btn sm ${State.ui.ganttCriticalOnly?'active':''}" data-act="gantt-critical" title="Show only critical-path tasks">${icon("alert","ico")} Critical only</button>
+            <button class="btn sm ${State.ui.ganttShowActual!==false?'active':''}" data-act="gantt-actual" title="Show planned vs actual progress (lower bar = actual effort/% done)">${icon("check","ico")} Plan/Actual</button>
             <button class="btn sm" data-act="gantt-png" title="Export the Gantt as a PNG image">${icon("download","ico")} PNG</button>
             <button class="btn sm" data-act="gantt-print" title="Print / save the Gantt as PDF">${icon("printer","ico")} Print</button>
           </div>
@@ -2093,6 +2253,26 @@ function viewScheduling(){
   // store rows for postRender
   ;
 }
+/* Planned-vs-actual comparison for a task: derives actual effort/elapsed from
+   time-tracking sessions, actual labor hours, fixed-duration progress, or % complete. */
+function taskActual(t, sc){
+  const workers=clamp(t.assignedWorkers||1, Math.max(1,t.minWorkers||1), Math.max(t.minWorkers||1,t.maxWorkers||1));
+  const planMin=(sc.workMin||0)+(sc.cureMin||0)+(sc.coolMin||0);
+  const pct=clamp(Math.round(t.percentComplete||0),0,100);
+  const done=t.status==="COMPLETE"||pct>=100;
+  const sessions=(State.timeSessions||[]).filter(s=>s.taskId===t.id);
+  let actWorkMin=0, basis="none";
+  if(sessions.length){ actWorkMin=sessions.reduce((a,s)=>a+Math.max(0,((s.endMs||Date.now())-s.startMs))/MIN,0); basis="time"; }
+  else if((t.fixedDurationHrs||0)>0 && (done||pct>0)){ actWorkMin=(t.fixedDurationHrs*60)*(done?1:pct/100); basis="fixed"; }
+  else if((t.actualLaborHours||0)>0){ actWorkMin=Math.ceil((t.actualLaborHours*60)/Math.max(1,workers)); basis="labor"; }
+  else if(pct>0){ actWorkMin=(sc.workMin||0)*(pct/100); basis="pct"; }
+  const hasActual= basis!=="none" || done || t.status==="WORKING";
+  const actMin= actWorkMin + (done? ((sc.cureMin||0)+(sc.coolMin||0)) : 0);
+  const ratio= planMin>0? actMin/planMin : (done?1:0);
+  const deltaH=Math.round((actMin-planMin)/60*10)/10;
+  return { hasActual, pct, done, inProgress: hasActual&&!done, actRatio:ratio, actMin, planMin, actLate: done && actMin>planMin*1.02, deltaH };
+}
+
 postRender.scheduling=function(){
   const ap=activeProgram(); if(!ap) return; const sched=State.schedules[ap.id];
   const acFilter=State.ui.activeAircraft && byId(State.aircraft,State.ui.activeAircraft) ? State.ui.activeAircraft : (State.aircraft.find(a=>a.programId===ap.id)||{}).id;
@@ -2110,7 +2290,7 @@ postRender.scheduling=function(){
     rows.push({isGroup:true,label:st.name,stageId:st.id,collapsed,count:items.length,stageStartMs:spanStart,stageEndMs:spanEnd});
     if(!collapsed) list.forEach(o=>{ const t=o.t, sc=o.s;
       const preds=State.dependencies.filter(d=>d.taskId===t.id).map(d=>{const p=byId(State.tasks,d.predecessorId);return p?(p.wbsCode+" "+p.name+" ("+(DEP_LABEL[d.type]||d.type)+(d.lagHours?" +"+d.lagHours+"h":"")+")"):null;}).filter(Boolean);
-      rows.push({taskId:t.id,label:t.wbsCode+" "+t.name,stage:st.name,startMs:sc.startMs,workEndMs:sc.workEndMs,cureEndMs:sc.cureEndMs,finishMs:sc.finishMs,critical:sc.onCriticalPath,done:t.status==="COMPLETE",preds,workMin:sc.workMin,cureMin:sc.cureMin,coolMin:sc.coolMin}); });
+      const A=taskActual(t,sc); rows.push({taskId:t.id,label:t.wbsCode+" "+t.name,stage:st.name,startMs:sc.startMs,workEndMs:sc.workEndMs,cureEndMs:sc.cureEndMs,finishMs:sc.finishMs,critical:sc.onCriticalPath,done:t.status==="COMPLETE",preds,workMin:sc.workMin,cureMin:sc.cureMin,coolMin:sc.coolMin,hasActual:A.hasActual,pct:A.pct,inProgress:A.inProgress,actRatio:A.actRatio,actMin:A.actMin,deltaH:A.deltaH,actLate:A.actLate,crew:t.assignedWorkers,wbs:t.wbsCode,skill:t.laborSkill}); });
   }); }
   const host=document.getElementById("gantt2-host"); if(host) Gantt2.build(host, rows, {calId: activeCalendarId(ap.id)});
 };
@@ -2186,6 +2366,112 @@ postRender.capacity=function(){
 
 <script>
 /* ---------- REPORTS ---------- */
+/* Per-aircraft live status: current station, station %, overall %, schedule window. */
+function acStatus(acId){
+  const ac=byId(State.aircraft,acId);
+  const stages=State.stages.filter(s=>s.aircraftId===acId).sort((a,b)=>a.sequence-b.sequence);
+  const groups=stages.map(s=>({stage:s,tasks:State.tasks.filter(t=>t.stageId===s.id)}));
+  const allTasks=groups.reduce((a,g)=>a.concat(g.tasks),[]);
+  const overall= allTasks.length? round(sum(allTasks,t=>t.percentComplete||0)/allTasks.length,0):0;
+  let curIdx=-1; for(let i=0;i<groups.length;i++){ const ts=groups[i].tasks; if(ts.length && ts.some(t=>t.status!=="COMPLETE")){ curIdx=i; break; } }
+  const released= curIdx<0 && groups.some(g=>g.tasks.length);
+  const started= allTasks.some(t=>(t.percentComplete||0)>0 || (t.status&&t.status!=="NOT_STARTED"));
+  let stationPct=0; if(curIdx>=0){ const ts=groups[curIdx].tasks; stationPct= ts.length? round(sum(ts,t=>t.percentComplete||0)/ts.length,0):0; }
+  const sched= ac? State.schedules[ac.programId] : null; let finMs=null,startMs=null;
+  if(sched){ const ids=new Set(allTasks.map(t=>t.id)); const ss=sched.taskSchedules.filter(s=>ids.has(s.taskId));
+    if(ss.length){ finMs=Math.max.apply(null,ss.map(s=>s.finishMs)); startMs=Math.min.apply(null,ss.map(s=>s.startMs)); } }
+  const behind= finMs!=null && ac && ac.plannedFinishMs && finMs>ac.plannedFinishMs+DAY;
+  return { ac, stages, totalStations:stages.length, currentSeq: curIdx>=0?groups[curIdx].stage.sequence:(released?stages.length+1:0),
+    currentStation: released?"Released":(curIdx>=0?groups[curIdx].stage.name:(started?"In setup":"Not started")),
+    currentStageId: curIdx>=0?groups[curIdx].stage.id:null, doneStations: curIdx<0?(released?stages.length:0):curIdx,
+    stationPct, overall, released, started, finMs, startMs, behind };
+}
+function buildOrder(acs){ return acs.slice().sort((x,y)=> ((x.buildSeq||0)-(y.buildSeq||0)) || ((x.plannedStartMs||0)-(y.plannedStartMs||0)) || String(x.serialNumber||"").localeCompare(String(y.serialNumber||""),undefined,{numeric:true})); }
+
+function viewLine(){
+  const ap=activeProgram();
+  if(!ap) return viewHead("Production Line","Live station status \u2014 which aircraft is where")+emptyState("flag","No active program","Open a program to see the production line.","");
+  const acs=State.aircraft.filter(a=>a.programId===ap.id);
+  if(!acs.length) return viewHead("Production Line",esc(ap.name))+emptyState("flag","No aircraft yet","Add tail numbers to this program first.","");
+  const sched=State.schedules[ap.id];
+  const sorted=buildOrder(acs);
+  const maxSt=Math.max.apply(null,acs.map(a=>State.stages.filter(s=>s.aircraftId===a.id).length).concat([1]));
+  const refStages=State.stages.filter(s=>s.aircraftId===sorted[0].id).sort((a,b)=>a.sequence-b.sequence).map(s=>s.name);
+  const stats=sorted.map(a=>acStatus(a.id));
+  const released=stats.filter(s=>s.released).length, building=stats.filter(s=>s.started&&!s.released).length, notStarted=stats.filter(s=>!s.started).length;
+  const behind=stats.filter(s=>s.behind).length;
+  const avg= stats.length? round(sum(stats,s=>s.overall)/stats.length,0):0;
+
+  // station header labels
+  const heads=refStages.map((nm,i)=>`<div class="st" style="left:${((i+0.5)/maxSt*100).toFixed(2)}%">${i+1}. ${esc(nm.length>16?nm.slice(0,15)+"\u2026":nm)}</div>`).join("")
+    +`<div class="st" style="left:99%;color:var(--green)">\u2691 Released</div>`;
+  // runners
+  const rows=stats.map(s=>{ const a=s.ac;
+    const pos= s.released?100: (s.started? clamp(((Math.max(0,s.currentSeq-1)+s.stationPct/100)/maxSt)*100,2,98) : 1.5);
+    const cls= s.released?"done": (s.behind?"behind": (s.started?"":"idle"));
+    const ticks=refStages.map((_,i)=>`<div class="tick" style="left:${((i+1)/maxSt*100).toFixed(2)}%"></div>`).join("");
+    return `<div class="race-row"><div class="race-name" title="${esc(a.serialNumber)}">${esc(a.serialNumber)}</div>
+      <div class="race-track">${ticks}<div class="race-fill" style="width:${pos}%"></div><div class="race-finish"></div>
+        <div class="runner ${cls}" style="left:${pos}%" title="${esc(s.currentStation)} \u00b7 ${s.overall}%">${esc(a.serialNumber.replace(/^.*[-_]/,""))} \u00b7 ${s.overall}%</div></div></div>`;
+  }).join("");
+
+  const lm=ap.lineMode||"off", lsc=ap.lineScope||"program";
+  const controls=`<div class="grid cols-3" style="margin:0 0 14px">
+    <div class="field"><label>Line gating</label>
+      <select data-act="set-line-mode">
+        <option value="off" ${lm==="off"?"selected":""}>Off \u2014 all tails build in parallel</option>
+        <option value="serial" ${lm==="serial"?"selected":""}>Serial \u2014 finish SN1 before SN2 starts</option>
+        <option value="pulse" ${lm==="pulse"?"selected":""}>Pulse line \u2014 SN2 enters a station as SN1 leaves it (relay)</option>
+      </select></div>
+    <div class="field"><label>Line scope</label>
+      <select data-act="set-line-scope">
+        <option value="program" ${lsc==="program"?"selected":""}>Whole program (one line)</option>
+        <option value="model" ${lsc==="model"?"selected":""}>Per model (separate line each model)</option>
+      </select></div>
+    <div class="field"><label>&nbsp;</label><button class="btn" style="width:100%" data-act="run-schedule">${icon("schedule","ico")} Recalculate line</button></div>
+  </div>`;
+
+  const kpis=`<div class="grid cols-5" style="margin-bottom:14px">
+    <div class="kpi"><div class="label">Aircraft</div><div class="val">${acs.length}</div><div class="meta">in this program</div></div>
+    <div class="kpi"><div class="label">Released</div><div class="val" style="color:var(--green)">${released}</div><div class="meta">past the finish line</div></div>
+    <div class="kpi"><div class="label">In build</div><div class="val" style="color:var(--accent)">${building}</div><div class="meta">on the line now</div></div>
+    <div class="kpi"><div class="label">Behind plan</div><div class="val" style="color:${behind?"var(--red)":"var(--ink)"}">${behind}</div><div class="meta">forecast past planned finish</div></div>
+    <div class="kpi"><div class="label">Avg completion</div><div class="val">${avg}%</div><div class="meta">${notStarted} not started</div></div>
+  </div>`;
+
+  const tbl=`<div class="panel"><div class="panel-h"><span class="eyebrow">Status board</span><h3>Aircraft status</h3><span class="spacer"></span>
+      <button class="btn sm" data-act="fleet-report">${icon("report","ico")} Status report (PDF)</button></div>
+    <div class="panel-b"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>Serial</th><th>Model</th><th>Current station</th><th class="num">Station</th><th class="num">Overall</th><th>Status</th><th>Forecast finish</th><th>Order</th></tr></thead><tbody>${
+    stats.map((s,i)=>{ const a=s.ac; const stCls= s.released?"ok":(s.behind?"err":(s.started?"info":""));
+      const stLabel= s.released?"Released":(s.behind?"Behind":(s.started?"In build":"Not started"));
+      return `<tr><td>${i+1}</td><td><b>${esc(a.serialNumber)}</b></td><td>${esc(a.model)}</td>
+        <td>${s.released?'<span style="color:var(--green)">\u2691 Released</span>':esc(s.currentStation)}</td>
+        <td class="num">${s.released?"\u2014":s.stationPct+"%"}</td>
+        <td class="num"><b>${s.overall}%</b></td>
+        <td><span class="chip ${stCls}">${stLabel}</span></td>
+        <td>${s.finMs?fmtDate(s.finMs):"\u2014"}${(a.plannedFinishMs&&s.finMs&&s.finMs>a.plannedFinishMs+DAY)?' <span style="color:var(--red)">\u25B2</span>':''}</td>
+        <td style="white-space:nowrap"><button class="icobtn" data-act="line-build-up" data-id="${a.id}" title="Build earlier">\u25B2</button><button class="icobtn" data-act="line-build-down" data-id="${a.id}" title="Build later">\u25BC</button></td></tr>`; }).join("")
+  }</tbody></table></div></div></div>`;
+
+  return viewHead("Production Line", esc(ap.name)+" \u00b7 which aircraft is at which station",
+      `<button class="btn sm" data-act="fleet-report">${icon("report","ico")} Status report</button>`)+
+    controls+kpis+
+    `<div class="panel" style="margin-bottom:14px"><div class="panel-h"><span class="eyebrow">Relay view</span><h3>Stations \u2192 finish line</h3>
+       <span class="spacer"></span><span class="muted" style="font-size:11px">${lm==="off"?"Parallel build":(lm==="serial"?"Serial gating ON":"Pulse line ON")}${lsc==="model"?" \u00b7 per model":""}</span></div>
+      <div class="panel-b"><div class="race-wrap"><div class="race-head">${heads}</div>${rows}</div></div></div>`+
+    tbl;
+}
+
+function lineReorder(acId,dir){ const ap=activeProgram(); if(!ap) return;
+  const acs=buildOrder(State.aircraft.filter(a=>a.programId===ap.id));
+  // ensure contiguous buildSeq
+  acs.forEach((a,i)=>a.buildSeq=i);
+  const idx=acs.findIndex(a=>a.id===acId); if(idx<0) return; const j= dir<0? idx-1: idx+1; if(j<0||j>=acs.length) return;
+  const t=acs[idx].buildSeq; acs[idx].buildSeq=acs[j].buildSeq; acs[j].buildSeq=t;
+  audit("AIRCRAFT",acId,"UPDATE","buildSeq",String(idx),String(j));
+  if(State.schedules[ap.id]) runSchedule(ap.id); commit();
+}
+
 function viewReports(){
   const ap=activeProgram();
   if(!ap) return viewHead("Reports","")+emptyState("report","No active program","","");
@@ -2229,6 +2515,8 @@ function viewReports(){
                ["efficiency","Efficiency & Learning Curve","Required vs achieved efficiency, serial-build learning curve"]
               ].map(([k,t,d])=>`<button class="btn" style="justify-content:flex-start;text-align:left;padding:10px 12px" data-act="export-pdf" data-kind="${k}">
                 ${icon("pdf","ico")}<span><b>${t}</b><br><span class="muted" style="font-weight:400;font-size:11px">${d}</span></span></button>`).join("")}
+            <button class="btn" style="justify-content:flex-start;text-align:left;padding:10px 12px" data-act="fleet-report">
+              ${icon("flag","ico")}<span><b>Fleet Status (all / selected / by model)</b><br><span class="muted" style="font-weight:400;font-size:11px">Cross-program tail status: current station, % complete, schedule variance, RAG \u00b7 PDF &amp; CSV</span></span></button>
           </div>
         </div></div>
     </div>`;
@@ -2462,6 +2750,13 @@ function programModal(id){
         ${PROG_STATUS.map(s=>`<option ${p&&p.status===s?"selected":""}>${s}</option>`).join("")}</select></div>
     </div>
     <div class="field"><label>Program name</label><input id="m_name" value="${esc(p?p.name:"")}" placeholder="Tactical UAV"></div>
+    <div class="grid cols-2"><div class="field"><label>Line gating</label>
+      <select id="m_linemode"><option value="off" ${(p&&p.lineMode==="off")||!p||!p.lineMode?"selected":""}>Off (parallel)</option>
+        <option value="serial" ${p&&p.lineMode==="serial"?"selected":""}>Serial (SN1 then SN2)</option>
+        <option value="pulse" ${p&&p.lineMode==="pulse"?"selected":""}>Pulse line (relay)</option></select></div>
+      <div class="field"><label>Line scope</label>
+      <select id="m_linescope"><option value="program" ${!p||p.lineScope!=="model"?"selected":""}>Whole program</option>
+        <option value="model" ${p&&p.lineScope==="model"?"selected":""}>Per model</option></select></div></div>
     <div class="field"><label>Description</label><textarea id="m_desc" rows="3">${esc(p?p.description:"")}</textarea></div>`;
   const foot=`<button class="btn" data-act="m-close">Cancel</button>
     <button class="btn primary" data-act="save-program" data-id="${id||""}">${icon("check","ico")} ${isNew?"Create program":"Save"}</button>`;
@@ -2469,13 +2764,15 @@ function programModal(id){
 }
 function saveProgram(id){
   const code=mvt("m_code"), name=mvt("m_name")||"Untitled Program", status=mv("m_status"), desc=mvt("m_desc");
+  const lineMode=mv("m_linemode")||"off", lineScope=mv("m_linescope")||"program";
   if(id){ const p=byId(State.programs,id); if(!p){ closeModal(); return; }
     if(p.name!==name) audit("PROGRAM",id,"UPDATE","name",p.name,name);
     if(p.status!==status) audit("PROGRAM",id,"UPDATE","status",p.status,status);
-    p.code=code; p.name=name; p.status=status; p.description=desc;
+    if((p.lineMode||"off")!==lineMode) audit("PROGRAM",id,"UPDATE","lineMode",p.lineMode||"off",lineMode);
+    p.code=code; p.name=name; p.status=status; p.description=desc; p.lineMode=lineMode; p.lineScope=lineScope;
   } else {
     const p={ id:uid("prog"), code:code||"PROG", name, description:desc, status,
-      aircraftIds:[], defaultCalendarId:ensureCalendarId(), activeBaselineId:null, stageGating:false, createdAtMs:Date.now() };
+      aircraftIds:[], defaultCalendarId:ensureCalendarId(), activeBaselineId:null, stageGating:false, lineMode, lineScope, createdAtMs:Date.now() };
     State.programs.push(p); State.ui.activeProgram=State.ui.activeProgram||p.id;
     audit("PROGRAM",p.id,"CREATE",null,null,name);
   }
@@ -3104,6 +3401,113 @@ postRender.efficiency=function(){ const ap=activeProgram(); if(!ap) return; cons
   if(lc.enough){ const cv=document.getElementById("lc-canvas"); if(cv) Chart.learningCurve(cv, lc.points, lc.curve, {obsMax:lc.obsMax, height:260}); } };
 
 
+function fleetReportModal(){
+  const progs=State.programs; if(!progs.length){ toast("No programs yet","warn"); return; }
+  const ap=activeProgram();
+  const models=[...new Set(State.aircraft.map(a=>a.model).filter(Boolean))].sort();
+  openModal("Fleet status report", `
+    <div class="field"><label>Scope</label>
+      <select id="fr_scope">
+        <option value="program">This program${ap?" \u2014 "+esc(ap.name):""}</option>
+        <option value="all">All programs (whole fleet)</option>
+      </select></div>
+    <div class="field"><label>Model filter</label>
+      <select id="fr_model"><option value="">All models</option>${models.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></div>
+    <div class="hint">Generates a professional PDF: fleet summary, per-program roll-up, and a per-aircraft status table (current station, % complete, schedule variance, RAG health). Choose \u201cAll programs\u201d for an executive fleet view, or filter to one model.</div>`,
+    `<button class="btn" data-act="m-close">Cancel</button>
+     <button class="btn" data-act="fleet-report-csv">${icon("download","ico")} CSV</button>
+     <button class="btn primary" data-act="fleet-report-go">${icon("report","ico")} Generate PDF</button>`);
+}
+function fleetScopeAircraft(scope, model){
+  let acs;
+  if(scope==="all") acs=State.aircraft.slice();
+  else { const ap=activeProgram(); acs=ap? State.aircraft.filter(a=>a.programId===ap.id):[]; }
+  if(model) acs=acs.filter(a=>a.model===model);
+  return acs;
+}
+function fleetReportCSV(){
+  const scope=(document.getElementById("fr_scope")||{}).value||"program";
+  const model=(document.getElementById("fr_model")||{}).value||"";
+  const acs=fleetScopeAircraft(scope,model); closeModal();
+  if(!acs.length){ toast("No aircraft in scope","warn"); return; }
+  const rows=[["Program","Serial","Model","BuildRev","CurrentStation","StationPct","OverallPct","Status","PlannedFinish","ForecastFinish","VarianceDays"]];
+  acs.forEach(a=>{ const st=acStatus(a.id); const prog=byId(State.programs,a.programId);
+    const varDays= (a.plannedFinishMs&&st.finMs)? Math.round((st.finMs-a.plannedFinishMs)/DAY):"";
+    rows.push([prog?prog.name:"",a.serialNumber,a.model,a.buildRevision,st.released?"Released":st.currentStation,st.released?"":st.stationPct,st.overall,
+      st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started")),
+      a.plannedFinishMs?fmtDate(a.plannedFinishMs):"", st.finMs?fmtDate(st.finMs):"", varDays]); });
+  const csv=rows.map(r=>r.map(c=>{ c=String(c==null?"":c); return /[",\n]/.test(c)?'"'+c.replace(/"/g,'""')+'"':c; }).join(",")).join("\r\n");
+  triggerDownload("fleet-status-"+isoStamp()+".csv", csv, "text/csv;charset=utf-8"); toast("Fleet status CSV exported");
+}
+function exportFleetPDF(){
+  const scope=(document.getElementById("fr_scope")||{}).value||"program";
+  const model=(document.getElementById("fr_model")||{}).value||"";
+  closeModal();
+  const doc=pdfDoc(); if(!doc){ toast("PDF engine offline \u2014 use Print \u2192 Save as PDF","warn"); return; }
+  const acs=fleetScopeAircraft(scope,model);
+  if(!acs.length){ toast("No aircraft in scope","warn"); return; }
+  const M=44, W=doc.internal.pageSize.getWidth(), H=doc.internal.pageSize.getHeight(), CW=W-2*M; let y=0;
+  const C={ink:[28,38,52],sub:[110,125,140],line:[223,229,236],green:[22,140,70],amber:[193,130,10],red:[206,42,42],blue:[37,99,235],head:[233,239,245],zebra:[247,249,251]};
+  const scopeName= scope==="all"?"All programs":(activeProgram()?activeProgram().name:"Program");
+  const sub= scopeName+(model?"  \u00b7  Model: "+model:"  \u00b7  All models");
+  function ensure(h){ if(y+h>H-40){ doc.addPage(); y=52; pageNum(); } }
+  let pages=1; function pageNum(){ doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub); doc.text((State.settings.companyName||"AeroPlan Pro")+"  \u00b7  Fleet Status", M, H-22); }
+  function header(){ doc.setFillColor(10,14,20); doc.rect(0,0,W,68,"F"); doc.setFillColor(56,189,248); doc.rect(0,68,W,3,"F");
+    let tx=M; const lg=State.settings.logoDataUrl;
+    if(lg){ try{ const fmt=/png/i.test(lg)?"PNG":/webp/i.test(lg)?"WEBP":"JPEG"; doc.addImage(lg,fmt,M,14,40,40); tx=M+50; }catch(_){ } }
+    if(!lg){ doc.setTextColor(56,189,248); doc.setFont("helvetica","bold"); doc.setFontSize(9); doc.text((State.settings.logoText||"APP").toUpperCase(),tx,30); }
+    doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(15); doc.text("Fleet Status Report", tx, 50);
+    doc.setFont("helvetica","normal"); doc.setFontSize(8); doc.setTextColor(150,170,190);
+    doc.text((State.settings.companyName||"AeroPlan Pro"), W-M, 26, {align:"right"});
+    doc.text("Prepared by "+(State.settings.userLabel||"Planner"), W-M, 38, {align:"right"});
+    doc.text("Generated "+new Date().toLocaleString(), W-M, 50, {align:"right"});
+    doc.setFillColor(244,247,250); doc.rect(0,71,W,30,"F"); doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(sub,M,90);
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.sub); doc.text(acs.length+" aircraft", W-M, 90, {align:"right"}); y=120; pageNum(); }
+  function section(t){ ensure(30); doc.setFillColor(56,189,248); doc.rect(M,y-9,3,13,"F"); doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(t,M+9,y+1); y+=8; doc.setDrawColor.apply(doc,C.line); doc.line(M,y,W-M,y); y+=16; }
+  function band(cards){ ensure(60); const n=cards.length, gap=9, cw=(CW-gap*(n-1))/n;
+    cards.forEach((c,i)=>{ const x=M+i*(cw+gap); doc.setFillColor(248,250,252); doc.setDrawColor.apply(doc,C.line); doc.roundedRect(x,y,cw,50,5,5,"FD");
+      doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor.apply(doc,C.sub); doc.text(String(c.label).toUpperCase(),x+8,y+14);
+      doc.setFont("helvetica","bold"); doc.setFontSize(16); doc.setTextColor.apply(doc,(c.color||C.ink)); doc.text(String(c.value),x+8,y+34);
+      if(c.sub){ doc.setFont("helvetica","normal"); doc.setFontSize(7); doc.setTextColor.apply(doc,C.sub); doc.text(String(c.sub),x+8,y+45); } }); y+=62; }
+  function table(cols,widths,data,cellCol){ const x0=M; ensure(26); doc.setFillColor.apply(doc,C.head); doc.rect(M,y-12,CW,20,"F");
+    doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor(64,78,94); let x=x0;
+    cols.forEach((c,i)=>{ const r=/^>/.test(c); const lbl=c.replace(/^>/,""); doc.text(lbl, r?x+widths[i]-4:x+4, y+2, {align:r?"right":"left"}); x+=widths[i]; });
+    y+=16; doc.setFont("helvetica","normal"); doc.setFontSize(8);
+    data.forEach((row,ri)=>{ ensure(14); if(ri%2===1){ doc.setFillColor.apply(doc,C.zebra); doc.rect(M,y-10,CW,14,"F"); }
+      x=x0; row.forEach((cell,ci)=>{ const r=/^>/.test(cols[ci]); let col=C.ink; if(cellCol){ const cc=cellCol(ri,ci,cell); if(cc) col=cc; }
+        doc.setTextColor.apply(doc,col); let sVal=String(cell==null?"":cell); const max=widths[ci]-7; while(doc.getTextWidth(sVal)>max && sVal.length>3) sVal=sVal.slice(0,-2);
+        doc.text(sVal, r?x+widths[ci]-4:x+4, y, {align:r?"right":"left"}); x+=widths[ci]; });
+      y+=14; doc.setDrawColor(236,240,244); doc.line(M,y-10,W-M,y-10); }); y+=10; }
+
+  header();
+  // overall summary
+  const allSt=acs.map(a=>({a,st:acStatus(a.id)}));
+  const rel=allSt.filter(o=>o.st.released).length, bld=allSt.filter(o=>o.st.started&&!o.st.released).length, beh=allSt.filter(o=>o.st.behind).length;
+  const avg= allSt.length? Math.round(allSt.reduce((s,o)=>s+o.st.overall,0)/allSt.length):0;
+  section("Fleet summary");
+  band([{label:"Aircraft",value:acs.length},{label:"Released",value:rel,color:C.green},{label:"In build",value:bld,color:C.blue},
+        {label:"Behind plan",value:beh,color:beh?C.red:C.ink},{label:"Avg completion",value:avg+"%"}]);
+
+  // group by program
+  const byProg={}; acs.forEach(a=>{ (byProg[a.programId]=byProg[a.programId]||[]).push(a); });
+  Object.keys(byProg).forEach(pid=>{ const prog=byId(State.programs,pid); const list=buildOrder(byProg[pid]);
+    const e=Analytics.evm(pid)||{SPI:1,CPI:1,pctComplete:0};
+    section((prog?prog.name:"Program")+"  \u2014  "+(prog?prog.code:""));
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.sub);
+    ensure(16); doc.text("SPI "+(e.SPI!=null?e.SPI.toFixed(2):"\u2014")+"    CPI "+(e.CPI!=null?e.CPI.toFixed(2):"\u2014")+"    Complete "+Math.round(e.pctComplete||0)+"%    Line: "+((prog&&prog.lineMode)||"off"), M, y); y+=18;
+    const data=list.map((a,i)=>{ const st=acStatus(a.id); const varD=(a.plannedFinishMs&&st.finMs)?Math.round((st.finMs-a.plannedFinishMs)/DAY):null;
+      return [String(i+1), a.serialNumber, a.model, st.released?"Released":st.currentStation, st.released?"\u2014":st.stationPct+"%", st.overall+"%",
+        st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started")),
+        st.finMs?fmtDate(st.finMs):"\u2014", varD==null?"\u2014":(varD>0?"+"+varD+"d":varD+"d")]; });
+    table([">#","Serial","Model","Current station",">Station",">Overall","Status","Forecast",">Var"],
+      [26,72,70,120,46,46,66,70,42], data,
+      (ri,ci,cell)=>{ if(ci===5){ const v=parseInt(cell); return v>=85?C.green:v>=40?C.amber:C.blue; }
+        if(ci===6) return cell==="Released"?C.green:(cell==="Behind"?C.red:(cell==="In build"?C.blue:C.sub));
+        if(ci===8 && /\+/.test(cell)) return C.red; return null; });
+  });
+  doc.save(("fleet-status-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_")); toast("Fleet status report exported");
+}
+
 function exportPDF(kind){
   const doc=pdfDoc();
   if(!doc){ toast("PDF engine offline \u2014 use your browser's Print \u2192 Save as PDF","warn"); return; }
@@ -3590,13 +3994,20 @@ function printModal(){
   openModal("Print Gantt chart", `
     <div class="field"><label>Time scale</label>
       <select id="pr_scale">
-        <option value="hour">Hourly (most detail \u2014 more pages)</option>
+        <option value="hour">Hourly \u2014 30-min Operations Board (printable shop-floor tracker)</option>
         <option value="day" selected>Daily</option>
         <option value="week">Weekly</option>
         <option value="month">Monthly (overview \u2014 fewest pages)</option>
       </select>
-      <div class="hint">Daily or Weekly suits most program reviews. Hourly is best for a single week or a few aircraft.</div></div>
+      <div class="hint">Daily/Weekly/Monthly print the visual Gantt (with planned vs actual bars). <b>Hourly</b> prints a <b>30-minute Operations Board</b>: a per-day grid with a tick-box in every 30-min work block, plus \u201c% done\u201d and initials columns \u2014 designed to be posted on the floor and updated by hand. Tip: filter to a single aircraft first.</div></div>
     <div class="swrow" style="margin-top:6px"><input type="checkbox" id="pr_wt" ${State.ui.ganttWorkTime!==false?"checked":""}><label for="pr_wt">Show only working hours (collapse nights, weekends &amp; holidays)</label></div>
+    <div class="field" style="margin-top:8px"><label>Operations board layout (Hourly only)</label>
+      <select id="pr_layout">
+        <option value="daily">Per-day pages (one board per working day)</option>
+        <option value="continuous">Continuous long roll (one wide strip — best for long schedules / plotter paper)</option>
+      </select></div>
+    <div class="field"><label>Paper (Hourly only)</label>
+      <select id="pr_paper"><option value="a4">A4 landscape</option><option value="a3">A3 landscape</option><option value="long">Long roll (1600mm strip)</option></select></div>
     <div class="hint">The printout is landscape with a title block, legend, a frozen task column &amp; date axis on every page, and page references. Use your browser\u2019s \u201cSave as PDF\u201d to keep a copy.</div>`,
     `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="gantt-print-go">${icon("printer","ico")} Print</button>`);
 }
@@ -3625,6 +4036,7 @@ document.addEventListener("click", (e)=>{
     case "gantt-today": Gantt2.gotoToday(); break;
     case "gantt-worktime": Gantt2.toggleWorkTime(); break;
     case "gantt-critical": State.ui.ganttCriticalOnly=!State.ui.ganttCriticalOnly; persist(); render(); break;
+    case "gantt-actual": State.ui.ganttShowActual=(State.ui.ganttShowActual===false); persist(); render(); break;
     case "gantt-png": Gantt2.exportPNG(); break;
     case "gantt-print": printModal(); break;
     case "ci-start": ciStart(); break;
@@ -3632,10 +4044,17 @@ document.addEventListener("click", (e)=>{
     case "ci-complete": ciClose(id,true); break;
     case "ci-add-tech": ciAddTechModal(); break;
     case "ci-add-tech-go": { const n=(document.getElementById("ci_tname")||{}).value||""; closeModal(); addTechnician(n); break; }
-    case "ci-print-qr": ciPrintQR(); break;
+    case "ci-print-qr": ciPrintQRModal(); break;
+    case "ci-print-qr-go": { const o={aircraftId:(document.getElementById("qr_ac")||{}).value||"", station:(document.getElementById("qr_station")||{}).value||"", activeOnly:!!((document.getElementById("qr_active")||{}).checked)}; closeModal(); setTimeout(()=>ciPrintQR(o),60); break; }
     case "ci-scan": ciScan(); break;
     case "ci-scan-stop": ciScanStop(); closeModal(); break;
-    case "gantt-print-go": { const sc=(document.getElementById("pr_scale")||{}).value||"day"; const wt=!!((document.getElementById("pr_wt")||{}).checked); closeModal(); setTimeout(()=>Gantt2.printChart({scale:sc,workTime:wt}),50); break; }
+    case "ci-log-manual": { const w=parseFloat((document.getElementById("ci_lm_workers")||{}).value)||1; const h=parseFloat((document.getElementById("ci_lm_hours")||{}).value)||0; ciLogManual(State.ui.checkinTask,w,h,false); break; }
+    case "line-build-up": lineReorder(id,-1); break;
+    case "line-build-down": lineReorder(id,1); break;
+    case "fleet-report": fleetReportModal(); break;
+    case "fleet-report-go": exportFleetPDF(); break;
+    case "fleet-report-csv": fleetReportCSV(); break;
+    case "gantt-print-go": { const sc=(document.getElementById("pr_scale")||{}).value||"day"; const wt=!!((document.getElementById("pr_wt")||{}).checked); const lay=(document.getElementById("pr_layout")||{}).value||"daily"; const pap=(document.getElementById("pr_paper")||{}).value||"a4"; closeModal(); setTimeout(()=>{ if(sc==="hour") Gantt2.printOpsBoard({workTime:wt,layout:lay,paper:pap}); else Gantt2.printChart({scale:sc,workTime:wt}); },50); break; }
     case "toggle-theme": { const ids=THEMES.map(t=>t.id); let i=(ids.indexOf(State.settings.theme)+1)%ids.length; State.settings.theme=ids[i]; applyTheme(); persist(); render(); toast("Theme: "+THEMES[i].name); break; }
     case "export-json": exportJSON(); break;
     case "import-json": importJSON(); break;
@@ -3747,6 +4166,11 @@ document.addEventListener("change",(e)=>{
   if(a==="ci-set-aircraft"){ State.ui.checkinAircraft=ce.value||null; State.ui.checkinTask=null; render(); return; }
   if(a==="ci-set-task"){ State.ui.checkinTask=ce.value||null; persist(); return; }
   if(a==="ci-progress"){ ciSetProgress(ce.dataset.id, parseFloat(ce.value)||0); return; }
+  if(a==="ci-set-workers"){ State.ui.checkinWorkers=clamp(Math.round(parseFloat(ce.value)||1),1,99); persist(); return; }
+  if(a==="set-line-mode"||a==="set-line-scope"){ const ap=activeProgram(); if(!ap) return;
+    if(a==="set-line-mode") ap.lineMode=ce.value; else ap.lineScope=ce.value;
+    audit("PROGRAM",ap.id,"UPDATE",a==="set-line-mode"?"lineMode":"lineScope",null,ce.value);
+    if(State.schedules[ap.id]) runSchedule(ap.id); commit(); toast("Line "+(a==="set-line-mode"?"gating":"scope")+" updated \u2014 schedule recalculated"); return; }
 });
 
 document.addEventListener("keydown",(e)=>{ if(e.key==="Escape" && els.modal && els.modal.innerHTML) closeModal(); });
@@ -3776,18 +4200,27 @@ function ciStart(){ const techId=State.ui.checkinTech, taskId=State.ui.checkinTa
   State.timeSessions=State.timeSessions||[];
   if(State.timeSessions.some(s=>!s.endMs && s.taskId===taskId && s.techId===techId)){ toast("Already checked in to this task","warn"); return; }
   const tk=byId(State.tasks,taskId); const tech=techById(techId);
-  State.timeSessions.push({id:uid("sess"),taskId,techId,techName:tech?tech.name:"",startMs:Date.now(),endMs:null});
+  const w=clamp(Math.round(State.ui.checkinWorkers||1),1,99);
+  State.timeSessions.push({id:uid("sess"),taskId,techId,techName:tech?tech.name:"",workers:w,startMs:Date.now(),endMs:null});
   if(tk && ["NOT_STARTED","READY","BLOCKED"].includes(tk.status)) tk.status="WORKING";
   audit("TASK",taskId,"UPDATE","checkIn",(tech?tech.name:"")+"","started");
-  commit(); toast((tech?tech.name:"Tech")+" checked in"); }
+  commit(); toast((tech?tech.name:"Tech")+" checked in"+(w>1?" ("+w+" workers)":"")); }
 
 function ciClose(sessionId, complete){ const ss=(State.timeSessions||[]).find(s=>s.id===sessionId); if(!ss||ss.endMs) return;
-  ss.endMs=Date.now(); const hrs=Math.max(0,(ss.endMs-ss.startMs)/HOUR); const tk=byId(State.tasks,ss.taskId);
-  if(tk){ tk.actualLaborHours=round((tk.actualLaborHours||0)+hrs,2);
+  ss.endMs=Date.now(); const hrs=Math.max(0,(ss.endMs-ss.startMs)/HOUR); const workers=Math.max(1,ss.workers||1);
+  const personHrs=hrs*workers; const tk=byId(State.tasks,ss.taskId);
+  if(tk){ tk.actualLaborHours=round((tk.actualLaborHours||0)+personHrs,2);
     if(complete){ tk.status="COMPLETE"; tk.percentComplete=100; }
-    else if(tk.status==="WORKING" && !(State.timeSessions||[]).some(s=>!s.endMs && s.taskId===tk.id)) { /* keep WORKING until completed */ }
-    audit("TASK",ss.taskId,"UPDATE", complete?"checkOutComplete":"checkOut", ss.techName, round(hrs,2)+"h"); }
-  commit(); toast(complete? "Task completed (+"+round(hrs,2)+"h)" : "Checked out (+"+round(hrs,2)+"h)"); }
+    audit("TASK",ss.taskId,"UPDATE", complete?"checkOutComplete":"checkOut", ss.techName+" \u00d7"+workers+"w", round(personHrs,2)+" person-h"); }
+  commit(); toast(complete? "Task completed (+"+round(personHrs,2)+" person-h)" : "Checked out (+"+round(personHrs,2)+" person-h)"); }
+
+/* Manual time log: actual labour hours = workers × hours (no live timer). */
+function ciLogManual(taskId, workers, hours, complete){ const tk=byId(State.tasks,taskId); if(!tk) return;
+  workers=clamp(Math.round(workers||1),1,99); hours=Math.max(0,hours||0); if(hours<=0){ toast("Enter hours > 0","warn"); return; }
+  const personHrs=round(workers*hours,2); tk.actualLaborHours=round((tk.actualLaborHours||0)+personHrs,2);
+  if(complete){ tk.status="COMPLETE"; tk.percentComplete=100; } else if(tk.status==="NOT_STARTED"){ tk.status="WORKING"; }
+  audit("TASK",taskId,"UPDATE","manualLog",workers+"w \u00d7 "+hours+"h", "+"+personHrs+" person-h");
+  commit(); toast("Logged "+personHrs+" person-hours ("+workers+"\u00d7"+hours+"h)"); }
 
 function ciSetProgress(taskId,pct){ const tk=byId(State.tasks,taskId); if(!tk) return; pct=clamp(Math.round(pct),0,100);
   tk.percentComplete=pct; if(pct>=100){ tk.status="COMPLETE"; } else if(tk.status==="COMPLETE"){ tk.status="WORKING"; }
@@ -3806,17 +4239,30 @@ function ciAddTechModal(){ openModal("Add technician",
   `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="ci-add-tech-go">Add</button>`); }
 
 /* ---- QR: print labels (uses qrcodejs if loaded; else prints deep-link text) ---- */
-function ciPrintQR(){ const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
+function ciPrintQRModal(){ const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
   const acs=State.aircraft.filter(a=>a.programId===ap.id);
-  const items=[]; acs.forEach(a=>{ const sids=State.stages.filter(s=>s.aircraftId===a.id).map(s=>s.id);
-    State.tasks.filter(t=>sids.includes(t.stageId)).sort((x,z)=>((x.seq||0)-(z.seq||0))).forEach(t=>items.push({t,ac:a})); });
-  if(!items.length){ toast("No tasks to label yet","warn"); return; }
+  const stNames=[...new Set(State.stages.filter(s=>acs.some(a=>a.id===s.aircraftId)).sort((a,b)=>a.sequence-b.sequence).map(s=>s.name))];
+  openModal("Print QR labels", `
+    <div class="field"><label>Aircraft</label><select id="qr_ac"><option value="">All aircraft in program</option>${acs.map(a=>`<option value="${a.id}">${esc(a.serialNumber)}</option>`).join("")}</select></div>
+    <div class="field"><label>Station</label><select id="qr_station"><option value="">All stations</option>${stNames.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join("")}</select></div>
+    <div class="swrow" style="margin-top:4px"><input type="checkbox" id="qr_active" checked><label for="qr_active">Only tasks still needing work (skip completed)</label></div>
+    <div class="hint">Generate just the labels an operator needs — e.g. one aircraft, one station, open tasks only — instead of the whole program. Scan a label in Check-in to start a timer on that task.</div>`,
+    `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="ci-print-qr-go">${icon("printer","ico")} Generate labels</button>`);
+}
+function ciPrintQR(opts){ opts=opts||{}; const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
+  let acs=State.aircraft.filter(a=>a.programId===ap.id);
+  if(opts.aircraftId) acs=acs.filter(a=>a.id===opts.aircraftId);
+  const items=[]; acs.forEach(a=>{ let stgs=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
+    if(opts.station) stgs=stgs.filter(s=>s.name===opts.station);
+    stgs.forEach(st=>{ State.tasks.filter(t=>t.stageId===st.id).sort((x,z)=>((x.seq||0)-(z.seq||0))).forEach(t=>{
+      if(opts.activeOnly && t.status==="COMPLETE") return; items.push({t,ac:a,station:st.name}); }); }); });
+  if(!items.length){ toast("No matching tasks to label","warn"); return; }
   const haveQR=qrLibReady();
   const cells=items.map(it=>{ const link=taskDeepLink(it.t.id); let img="";
     if(haveQR){ try{ const tmp=document.createElement("div"); new window.QRCode(tmp,{text:link,width:150,height:150,correctLevel:window.QRCode.CorrectLevel.M});
       const cv=tmp.querySelector("canvas"); const im=tmp.querySelector("img"); img= cv? '<img src="'+cv.toDataURL("image/png")+'">' : (im? '<img src="'+im.src+'">':""); }catch(_){ img=""; } }
     return '<div class="lbl"><div class="qr">'+(img||'<div class="noqr">QR library offline</div>')+'</div>'+
-      '<div class="meta"><div class="nm">'+esc(it.t.name)+'</div><div class="sub">'+esc(it.ac.serialNumber)+' \u00b7 WBS '+esc(it.t.wbsCode)+'</div>'+
+      '<div class="meta"><div class="nm">'+esc(it.t.name)+'</div><div class="sub">'+esc(it.ac.serialNumber)+' \u00b7 '+esc(it.station||"")+' \u00b7 WBS '+esc(it.t.wbsCode)+'</div>'+
       '<div class="lk">'+esc(link)+'</div></div></div>'; }).join("");
   const w=window.open("","_blank"); if(!w){ toast("Allow pop-ups to print labels","warn"); return; }
   w.document.write('<html><head><title>Task QR labels \u2014 '+esc(ap.name)+'</title><style>@page{margin:10mm}*{box-sizing:border-box}'+
@@ -3858,7 +4304,7 @@ function viewCheckin(){
 
   const openRows= open.length? open.map(s=>{ const tk=byId(State.tasks,s.taskId); const st=tk?byId(State.stages,tk.stageId):null; const acn= st?byId(State.aircraft,st.aircraftId):null;
     return `<div class="panel" style="margin-bottom:8px"><div class="panel-b" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-      <div style="flex:1;min-width:160px"><b>${tk?esc(tk.name):"—"}</b><div class="muted" style="font-size:11px">${acn?esc(acn.serialNumber):""} \u00b7 ${esc(s.techName||"")}</div></div>
+      <div style="flex:1;min-width:160px"><b>${tk?esc(tk.name):"—"}</b><div class="muted" style="font-size:11px">${acn?esc(acn.serialNumber):""} \u00b7 ${esc(s.techName||"")}${(s.workers||1)>1?" \u00b7 "+s.workers+" workers":""}</div></div>
       <div class="mono" style="font-size:18px;min-width:96px;text-align:right" id="ci-el-${s.id}">${ciFmtDur(Date.now()-s.startMs)}</div>
       <div style="display:flex;align-items:center;gap:6px">
         <label class="muted" style="font-size:11px">%</label><input type="number" min="0" max="100" value="${tk?tk.percentComplete||0:0}" data-act="ci-progress" data-id="${s.taskId}" style="width:58px;background:var(--panel-2);border:1px solid var(--line-2);color:var(--ink);border-radius:6px;padding:4px 6px">
@@ -3871,7 +4317,7 @@ function viewCheckin(){
 
   return viewHead("Check-in", esc(ap.name)+" \u00b7 shop-floor time tracking",
     `${scanLibReady()?`<button class="btn sm" data-act="ci-scan">${icon("aircraft","ico")} Scan QR</button>`:""}
-     <button class="btn sm" data-act="ci-print-qr">${icon("printer","ico")} Print QR labels</button>`)+`
+     <button class="btn sm" data-act="ci-print-qr">${icon("printer","ico")} Print QR labels…</button>`)+`
     <div class="split">
       <div class="panel"><div class="panel-h"><span class="eyebrow">Manual check-in</span><h3>Check a technician into a task</h3></div>
         <div class="panel-b">
@@ -3880,8 +4326,17 @@ function viewCheckin(){
             <button class="btn sm" data-act="ci-add-tech">${icon("plus","ico")} Add</button></div></div>
           <div class="field"><label>Aircraft</label><select data-act="ci-set-aircraft">${acOpts||'<option>— none —</option>'}</select></div>
           <div class="field"><label>Task</label><select data-act="ci-set-task">${taskOpts}</select></div>
+          <div class="field"><label>Workers on this check-in</label><input type="number" min="1" max="99" value="${State.ui.checkinWorkers||1}" data-act="ci-set-workers" style="width:90px">
+            <div class="hint" style="margin-top:3px">Actual labour hours = <b>workers \u00d7 time</b>. A 3-worker check-in for 2 h logs 6 person-hours.</div></div>
           <button class="btn primary" style="width:100%;margin-top:4px" data-act="ci-start">${icon("play","ico")} Check in &amp; start timer</button>
-          <div class="hint">No QR needed \u2014 this works on any device. QR is optional: print labels above and (when online) tap <b>Scan QR</b> to check in by camera. Time is added to the task\u2019s <b>actual labor hours</b> and feeds efficiency &amp; the learning curve.</div>
+          <div style="border-top:1px solid var(--line);margin:12px 0 8px;padding-top:10px">
+            <div class="muted" style="font-size:11px;margin-bottom:6px">Or log time already worked (no timer):</div>
+            <div style="display:flex;gap:6px;align-items:flex-end;flex-wrap:wrap">
+              <div><label class="muted" style="font-size:10px">Workers</label><input id="ci_lm_workers" type="number" min="1" max="99" value="1" style="width:74px"></div>
+              <div><label class="muted" style="font-size:10px">Hours each</label><input id="ci_lm_hours" type="number" min="0" step="0.25" value="0" style="width:84px"></div>
+              <button class="btn sm" data-act="ci-log-manual">${icon("plus","ico")} Log</button>
+            </div></div>
+          <div class="hint">No QR needed \u2014 this works on any device. QR is optional: print labels above and (when online) tap <b>Scan QR</b> to check in by camera. Time is added to the task\u2019s <b>actual labour hours</b> (person-hours) and feeds efficiency &amp; the learning curve.</div>
         </div></div>
       <div class="panel"><div class="panel-h"><span class="eyebrow">${open.length} active</span><h3>Currently checked in</h3></div>
         <div class="panel-b">${openRows}</div></div>
