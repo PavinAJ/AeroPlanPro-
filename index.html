@@ -385,6 +385,13 @@ canvas { display:block; }
 .runner{ position:absolute; top:50%; transform:translate(-50%,-50%); background:var(--accent); color:#04121f; font-size:10px; font-weight:700; padding:3px 8px; border-radius:12px; white-space:nowrap; box-shadow:0 1px 5px rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.25); z-index:2; }
 .runner.done{ background:var(--green); } .runner.behind{ background:var(--red); color:#fff; } .runner.idle{ background:var(--line-2); color:var(--ink-2); box-shadow:none; }
 @media (max-width:760px){ .race-head{ margin-left:84px; } .race-name{ width:74px; } .runner{ font-size:9px; padding:2px 6px; } }
+.pdash-row{ display:flex; align-items:center; gap:10px; margin:7px 0; }
+.pdash-name{ width:170px; flex:none; font-size:12px; color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pdash-bar{ flex:1; height:11px; background:var(--panel-2); border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+.pdash-fill{ height:100%; border-radius:6px; transition:width .3s; }
+.pdash-pct{ width:44px; text-align:right; font-size:12px; font-weight:700; }
+.pdash-chip{ width:104px; text-align:right; }
+@media (max-width:760px){ .pdash-name{ width:104px; } .pdash-chip{ width:84px; } }
 .g2-seg { display:inline-flex; border:1px solid var(--line-2); border-radius:8px; overflow:hidden; }
 .g2-seg button { border:0; background:var(--panel-2); color:var(--ink-2); padding:6px 12px; font-size:11.5px; cursor:pointer; font-weight:600; letter-spacing:.02em; }
 .g2-seg button + button { border-left:1px solid var(--line-2); }
@@ -1506,7 +1513,7 @@ const Chart = (function(){
 /* ================================================================== */
 const Gantt2 = (function(){
   const SCALE_PPH = { hour:34, day:5.2, week:1.35, month:0.40 };
-  const LABELW=256, AXISH=50, ROWH=26, MAXW=16000, MAXBODYH=560, SEG_GAP=7, PADX=22;
+  const LABELW=256, AXISH=50, ROWH=26, MAXW=16000, MAXBODYH=560, SEG_GAP=7, PADX=26;
   let cur=null;
   function cv(n){ return Chart.cssVar(n); }
   function setup(canvas, wL, hL){ const dpr=Math.min(2,(window.devicePixelRatio||1));
@@ -1525,14 +1532,15 @@ const Gantt2 = (function(){
     for(let d=cur.t0; d<cur.t1; d+=DAY) WorkCal.dayWindows(cur.cal,d).forEach(w=>cur.segs.push({s:w.s,e:w.e}));
     cur.segs.sort((a,b)=>a.s-b.s); if(!cur.segs.length) cur.segs=[{s:cur.t0,e:cur.t1}];
     let acc=0; cur.segs.forEach(sg=>{ cur.segCum.push(acc); acc+=(sg.e-sg.s); }); cur.totalWorkMs=acc; }
-  function Wx(ms){ const segs=cur.segs, cum=cur.segCum, pph=cur.pph; if(!segs.length) return 0;
+  function Wx(ms){ return PADX + _Wx(ms); }
+  function _Wx(ms){ const segs=cur.segs, cum=cur.segCum, pph=cur.pph; if(!segs.length) return 0;
     if(ms<=segs[0].s) return 0; let lo=0,hi=segs.length-1,idx=segs.length-1;
     while(lo<=hi){ const m=(lo+hi)>>1; if(segs[m].s>ms){ idx=m-1; hi=m-1; } else { lo=m+1; idx=m; } }
     if(idx<0) idx=0; const sg=segs[idx];
     if(ms<sg.s) return cum[idx]/HOUR*pph + idx*SEG_GAP;
     return (cum[idx]+Math.min(ms,sg.e)-sg.s)/HOUR*pph + idx*SEG_GAP; }
-  function Xcal(ms){ return (ms-cur.t0)/HOUR*cur.pph; }
-  function xOf(ms){ return PADX + (cur.workTime? Wx(ms) : Xcal(ms)); }
+  function Xcal(ms){ return PADX + (ms-cur.t0)/HOUR*cur.pph; }
+  function xOf(ms){ return cur.workTime? Wx(ms) : Xcal(ms); }
 
   function drawAxis(ctx){ if(!ctx) return; const W=cur.timelineW;
     ctx.strokeStyle=cv("--line-2"); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,AXISH-0.5); ctx.lineTo(W,AXISH-0.5); ctx.stroke();
@@ -2412,6 +2420,12 @@ function stationFlow(acId){ const sts=State.stages.filter(s=>s.aircraftId===acId
     const anyStarted= tk.some(t=>(t.percentComplete||0)>0 || (t.status&&t.status!=="NOT_STARTED"));
     const status= (tk.length && pct>=100)?"complete":(anyStarted?"active":"pending");
     return {name:st.name, pct, status}; }); }
+function stationFlowFleet(programId, stName){ const acs=State.aircraft.filter(a=>a.programId===programId);
+  let pctSum=0,cnt=0,anyAct=false,allComplete=true;
+  acs.forEach(a=>{ const st=State.stages.find(s=>s.aircraftId===a.id&&s.name===stName); if(!st){ allComplete=false; return; } const tk=State.tasks.filter(t=>t.stageId===st.id); if(!tk.length){ allComplete=false; return; }
+    const tw=sum(tk,_flowW); const p= tw? sum(tk,t=>_flowW(t)*(t.percentComplete||0))/tw:0; pctSum+=p; cnt++;
+    if(p>0&&p<100) anyAct=true; if(p<100) allComplete=false; if(tk.some(t=>t.status==="WORKING")) anyAct=true; });
+  const pct= cnt? round(pctSum/cnt,0):0; return { pct, status:(cnt&&allComplete)?"complete":((pct>0||anyAct)?"active":"pending") }; }
 function programFlow(programId){ const acs=State.aircraft.filter(a=>a.programId===programId); if(!acs.length) return [];
   const ref=State.stages.filter(s=>s.aircraftId===buildOrder(acs)[0].id).sort((a,b)=>a.sequence-b.sequence).map(s=>s.name);
   return ref.map(name=>{ let pctSum=0,cnt=0,anyAct=false,allComplete=true;
@@ -2487,13 +2501,25 @@ function viewLine(){
         <td style="white-space:nowrap"><button class="icobtn" data-act="line-build-up" data-id="${a.id}" title="Build earlier">\u25B2</button><button class="icobtn" data-act="line-build-down" data-id="${a.id}" title="Build later">\u25BC</button></td></tr>`; }).join("")
   }</tbody></table></div></div></div>`;
 
+  const behindNames={}; stats.forEach(st=>{ if(st.behind && !st.released) behindNames[st.currentStation]=true; });
+  const dashRows=refStages.map((nm,i)=>{ const fl=stationFlowFleet(ap.id,nm);
+    let label,cls; if(fl.status==="complete"){ label="Completed"; cls="ok"; }
+    else if(behindNames[nm]){ label="Delayed"; cls="err"; }
+    else if(fl.status==="active"){ label="In Progress"; cls="info"; }
+    else { label="Not Started"; cls=""; }
+    const col= fl.pct>=100?"var(--green)":fl.pct>=50?"var(--accent)":fl.pct>0?"var(--amber)":"var(--line-2)";
+    return `<div class="pdash-row"><div class="pdash-name" title="${esc(nm)}">${i+1}. ${esc(nm)}</div><div class="pdash-bar"><div class="pdash-fill" style="width:${fl.pct}%;background:${col}"></div></div><div class="pdash-pct" style="color:${col}">${fl.pct}%</div><div class="pdash-chip"><span class="chip ${cls}">${label}</span></div></div>`; }).join("");
+  const dash=`<div class="panel" style="margin-bottom:14px"><div class="panel-h"><span class="eyebrow">Station dashboard</span><h3>Production stations</h3><span class="spacer"></span><span class="muted" style="font-size:11px">${refStages.length} stations</span></div>
+    <div class="panel-b">
+      <div class="pdash-row" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--line)"><div class="pdash-name" style="font-weight:700;color:var(--ink)">Overall fleet progress</div><div class="pdash-bar" style="height:15px"><div class="pdash-fill" style="width:${avg}%;background:var(--accent)"></div></div><div class="pdash-pct" style="font-size:14px">${avg}%</div><div class="pdash-chip"></div></div>
+      ${dashRows}</div></div>`;
   return viewHead("Production Line", esc(ap.name)+" \u00b7 which aircraft is at which station",
       `<button class="btn sm" data-act="fleet-report">${icon("report","ico")} Status report</button>`)+
     controls+kpis+
     `<div class="panel" style="margin-bottom:14px"><div class="panel-h"><span class="eyebrow">Relay view</span><h3>Stations \u2192 finish line</h3>
        <span class="spacer"></span><span class="muted" style="font-size:11px">${lm==="off"?"Parallel build":(lm==="serial"?"Serial gating ON":"Pulse line ON")}${lsc==="model"?" \u00b7 per model":""}</span></div>
       <div class="panel-b"><div class="race-wrap"><div class="race-head">${heads}</div>${rows}</div></div></div>`+
-    tbl;
+    dash+tbl;
 }
 
 function lineReorder(acId,dir){ const ap=activeProgram(); if(!ap) return;
@@ -3514,31 +3540,87 @@ function exportFleetPDF(){
         doc.text(sVal, r?x+widths[ci]-4:x+4, y, {align:r?"right":"left"}); x+=widths[ci]; });
       y+=14; doc.setDrawColor(236,240,244); doc.line(M,y-10,W-M,y-10); }); y+=10; }
 
+  const BLUE=[37,99,235];
+  function pcol(p){ return p>=100?C.green : p>=50?BLUE : p>0?[193,130,10] : C.sub; }
+  function pbar(x,yy,w,h,pct,col){ doc.setFillColor(229,234,240); doc.roundedRect(x,yy,w,h,h/2,h/2,"F");
+    const fw=Math.max(h,Math.min(w,w*clamp(pct,0,100)/100)); doc.setFillColor.apply(doc,col); doc.roundedRect(x,yy,fw,h,h/2,h/2,"F"); }
+  function chip(x,yy,label,col){ doc.setFont("helvetica","bold"); doc.setFontSize(7); const tw=doc.getTextWidth(label)+12;
+    doc.setFillColor(Math.round(col[0]*0.16+214),Math.round(col[1]*0.16+214),Math.round(col[2]*0.16+214));
+    doc.roundedRect(x,yy-7.5,tw,11,3,3,"F"); doc.setTextColor.apply(doc,col); doc.text(label,x+6,yy+0.5); return tw; }
+  function subhead(t){ ensure(20); doc.setFont("helvetica","bold"); doc.setFontSize(9); doc.setTextColor.apply(doc,C.ink); doc.text(t,M,y); y+=13; }
+
   header();
-  // overall summary
   const allSt=acs.map(a=>({a,st:acStatus(a.id)}));
   const rel=allSt.filter(o=>o.st.released).length, bld=allSt.filter(o=>o.st.started&&!o.st.released).length, beh=allSt.filter(o=>o.st.behind).length;
   const avg= allSt.length? Math.round(allSt.reduce((s,o)=>s+o.st.overall,0)/allSt.length):0;
   section("Fleet summary");
-  band([{label:"Aircraft",value:acs.length},{label:"Released",value:rel,color:C.green},{label:"In build",value:bld,color:C.blue},
+  band([{label:"Aircraft",value:acs.length},{label:"Released",value:rel,color:C.green},{label:"In build",value:bld,color:BLUE},
         {label:"Behind plan",value:beh,color:beh?C.red:C.ink},{label:"Avg completion",value:avg+"%"}]);
+  ensure(36); doc.setFont("helvetica","bold"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub); doc.text("OVERALL FLEET PROGRESS",M,y);
+  doc.setFont("helvetica","bold"); doc.setFontSize(12); doc.setTextColor.apply(doc,pcol(avg)); doc.text(avg+"%",W-M,y+1,{align:"right"}); y+=7;
+  pbar(M,y,CW,15,avg,pcol(avg)); y+=28;
 
-  // group by program
+  const nameW=150; const chipX=M+CW-86; const pctX=chipX-8; const barX0=M+nameW; const barW=(pctX-40)-barX0;
   const byProg={}; acs.forEach(a=>{ (byProg[a.programId]=byProg[a.programId]||[]).push(a); });
   Object.keys(byProg).forEach(pid=>{ const prog=byId(State.programs,pid); const list=buildOrder(byProg[pid]);
     const e=Analytics.evm(pid)||{SPI:1,CPI:1,pctComplete:0};
     section((prog?prog.name:"Program")+"  \u2014  "+(prog?prog.code:""));
     doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.sub);
-    ensure(16); doc.text("SPI "+(e.SPI!=null?e.SPI.toFixed(2):"\u2014")+"    CPI "+(e.CPI!=null?e.CPI.toFixed(2):"\u2014")+"    Complete "+Math.round(e.pctComplete||0)+"%    Line: "+((prog&&prog.lineMode)||"off"), M, y); y+=18;
+    ensure(16); doc.text("SPI "+(e.SPI!=null?e.SPI.toFixed(2):"\u2014")+"      CPI "+(e.CPI!=null?e.CPI.toFixed(2):"\u2014")+"      Earned value "+Math.round(e.pctComplete||0)+"%      Line gating: "+((prog&&prog.lineMode)||"off"), M, y); y+=20;
+
+    const behindNames={}; list.forEach(a=>{ const st=acStatus(a.id); if(st.behind && !st.released) behindNames[st.currentStation]=true; });
+    const flow=programFlow(pid);
+
+    subhead("Station progress");
+    flow.forEach(stn=>{ ensure(17);
+      let status,scol;
+      if(stn.status==="complete"){ status="Completed"; scol=C.green; }
+      else if(behindNames[stn.name]){ status="Delayed"; scol=C.red; }
+      else if(stn.status==="active"){ status="In Progress"; scol=BLUE; }
+      else { status="Not Started"; scol=C.sub; }
+      doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink);
+      let nm=stn.name; while(doc.getTextWidth(nm)>nameW-8 && nm.length>4) nm=nm.slice(0,-2); doc.text(nm, M, y+3);
+      pbar(barX0, y-4, barW, 9, stn.pct, pcol(stn.pct));
+      doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor.apply(doc,pcol(stn.pct)); doc.text(stn.pct+"%", pctX, y+3, {align:"right"});
+      chip(chipX, y, status, scol); y+=16; });
+    y+=6;
+
+    subhead("Aircraft progress");
+    list.forEach(a=>{ const st=acStatus(a.id); ensure(19);
+      const status= st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started"));
+      const scol= st.released?C.green:(st.behind?C.red:(st.started?BLUE:C.sub));
+      doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink); doc.text(a.serialNumber, M, y+2);
+      doc.setFont("helvetica","normal"); doc.setFontSize(6.8); doc.setTextColor.apply(doc,C.sub); doc.text(st.released?"\u2691 released":(st.currentStation||""), M, y+11);
+      pbar(barX0, y-4, barW, 9, st.overall, pcol(st.overall));
+      doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor.apply(doc,pcol(st.overall)); doc.text(st.overall+"%", pctX, y+3, {align:"right"});
+      chip(chipX, y, status, scol); y+=19; });
+    y+=8;
+
+    subhead("Station matrix \u2014 aircraft \u00d7 station");
+    const stNames=flow.map(fl=>fl.name); const cols=stNames.length; const mLabelW=66; const cellW=(CW-mLabelW)/Math.max(1,cols); const cellH=14;
+    ensure(cellH*(list.length+1)+12);
+    doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor.apply(doc,C.sub);
+    for(let cI=0;cI<cols;cI++){ doc.text(String(cI+1), M+mLabelW+cI*cellW+cellW/2, y-1, {align:"center"}); } y+=2;
+    list.forEach(a=>{ const stt=acStatus(a.id);
+      doc.setFont("helvetica","bold"); doc.setFontSize(7); doc.setTextColor.apply(doc,C.ink); doc.text(a.serialNumber.length>11?a.serialNumber.slice(0,11):a.serialNumber, M, y+cellH-4.5);
+      for(let cI=0;cI<cols;cI++){ const stg=State.stages.find(ss=>ss.aircraftId===a.id && ss.name===stNames[cI]); let pct=0;
+        if(stg){ const tk=State.tasks.filter(t=>t.stageId===stg.id); const tw=sum(tk,_flowW); pct= tw? Math.round(sum(tk,t=>_flowW(t)*(t.percentComplete||0))/tw):0; }
+        let fill; if(pct>=100) fill=[205,236,219]; else if(pct>0){ const k=clamp(pct,0,100)/100; fill=[Math.round(226-18*k),Math.round(235-6*k),251]; } else fill=[244,246,249];
+        doc.setFillColor.apply(doc,fill); doc.setDrawColor(212,219,227); doc.setLineWidth(0.6); doc.rect(M+mLabelW+cI*cellW, y, cellW, cellH, "FD");
+        if(pct>0){ doc.setFont("helvetica","normal"); doc.setFontSize(6); doc.setTextColor.apply(doc, pct>=100?C.green:BLUE); doc.text(String(pct), M+mLabelW+cI*cellW+cellW/2, y+cellH-4.5, {align:"center"}); } }
+      if(stt.behind){ doc.setDrawColor.apply(doc,C.red); doc.setLineWidth(1.2); doc.rect(M+mLabelW, y, cellW*cols, cellH); doc.setLineWidth(0.6); }
+      y+=cellH; });
+    y+=8;
+    doc.setFont("helvetica","normal"); doc.setFontSize(6.5); doc.setTextColor.apply(doc,C.sub);
+    doc.splitTextToSize(stNames.map((n,i)=>(i+1)+". "+n).join("     "), CW).forEach(ln=>{ ensure(10); doc.text(ln,M,y); y+=9; }); y+=10;
+
     const data=list.map((a,i)=>{ const st=acStatus(a.id); const varD=(a.plannedFinishMs&&st.finMs)?Math.round((st.finMs-a.plannedFinishMs)/DAY):null;
-      return [String(i+1), a.serialNumber, a.model, st.released?"Released":st.currentStation, st.released?"\u2014":st.stationPct+"%", st.overall+"%",
-        st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started")),
-        st.finMs?fmtDate(st.finMs):"\u2014", varD==null?"\u2014":(varD>0?"+"+varD+"d":varD+"d")]; });
-    table([">#","Serial","Model","Current station",">Station",">Overall","Status","Forecast",">Var"],
-      [26,72,70,120,46,46,66,70,42], data,
-      (ri,ci,cell)=>{ if(ci===5){ const v=parseInt(cell); return v>=85?C.green:v>=40?C.amber:C.blue; }
-        if(ci===6) return cell==="Released"?C.green:(cell==="Behind"?C.red:(cell==="In build"?C.blue:C.sub));
-        if(ci===8 && /\+/.test(cell)) return C.red; return null; });
+      return [String(i+1), a.serialNumber, st.released?"Released":st.currentStation, st.overall+"%",
+        st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started")), st.finMs?fmtDate(st.finMs):"\u2014", varD==null?"\u2014":(varD>0?"+"+varD+"d":varD+"d")]; });
+    table([">#","Serial","Current station",">Overall","Status","Forecast",">Var"],[26,82,150,52,72,76,46], data,
+      (ri,ci,cell)=>{ if(ci===3){ const v=parseInt(cell); return v>=85?C.green:v>=40?BLUE:C.amber; }
+        if(ci===4) return cell==="Released"?C.green:(cell==="Behind"?C.red:(cell==="In build"?BLUE:C.sub));
+        if(ci===6 && /\+/.test(cell)) return C.red; return null; });
   });
   doc.save(("fleet-status-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_")); toast("Fleet status report exported");
 }
