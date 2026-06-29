@@ -491,6 +491,15 @@ const SCHEMA_VERSION = 6;
 
 const SKILL_LABEL = {COMPOSITE_TECH:"Composite Tech",ASSEMBLY_TECH:"Assembly Tech",AVIONICS_ENGINEER:"Avionics Engineer",TEST_ENGINEER:"Test Engineer",PAINT_TECH:"Paint Tech",QUALITY_INSPECTOR:"Quality Inspector"};
 const EQUIP_LABEL = {OVEN:"Oven",PAINT_BOOTH:"Paint Booth",CNC_MACHINE:"CNC Machine",CUTTING_TABLE:"Cutting Table",VACUUM_STATION:"Vacuum Station",BONDING_FIXTURE:"Bonding Fixture",WORKSTATION:"Workstation",STORAGE_RACK:"Storage Rack",TEST_STAND:"Test Stand",ENGINE_TEST_STAND:"Engine Test Stand"};
+/* Skill categories are user-editable. SKILL_LABEL / LABOR_SKILLS are kept in sync with State.skills. */
+function rebuildSkills(){ if(!Array.isArray(State.skills)||!State.skills.length) return;
+  for(const k in SKILL_LABEL) delete SKILL_LABEL[k];
+  LABOR_SKILLS.length=0;
+  State.skills.forEach(sk=>{ if(sk&&sk.key){ SKILL_LABEL[String(sk.key)]=sk.label||String(sk.key); LABOR_SKILLS.push(String(sk.key)); } }); }
+function normalizeSkills(){ if(!Array.isArray(State.skills)||!State.skills.length){ State.skills = LABOR_SKILLS.map(k=>({key:k,label:SKILL_LABEL[k]})); } rebuildSkills(); }
+function skillKeyFrom(label){ let base=String(label||"").trim().toUpperCase().replace(/[^A-Z0-9]+/g,"_").replace(/^_+|_+$/g,"")||"SKILL";
+  let key=base, n=2; const have=new Set((State.skills||[]).map(s=>s.key)); while(have.has(key)){ key=base+"_"+n; n++; } return key; }
+function skillInUse(key){ return State.laborPools.some(p=>p.category===key) || State.tasks.some(t=>t.laborSkill===key); }
 
 /* ------------------------------------------------------------------ */
 /* 2. SMALL UTILITIES                                                  */
@@ -569,7 +578,7 @@ const State = {
   programs:[], aircraft:[], stages:[], tasks:[], dependencies:[], equipmentReqs:[],
   laborPools:[], equipment:[], calendars:[], gates:[], auditLogs:[], baselines:[],
   scenarios:[], templates:[], schedules:{}, /* programId -> Schedule */
-  technicians:[], timeSessions:[],
+  technicians:[], timeSessions:[], skills:[],
   settings:{ userLabel:"Planner", theme:"dark", hoursPerDay:8, projectStartMs:null,
              companyName:"AeroPlan Pro", logoText:"APP", logoDataUrl:null },
   ui:{ module:"dashboard", activeProgram:null, activeAircraft:null, activeStage:null,
@@ -626,7 +635,7 @@ function snapshot(){
     dependencies:State.dependencies, equipmentReqs:State.equipmentReqs, laborPools:State.laborPools,
     equipment:State.equipment, calendars:State.calendars, gates:State.gates, auditLogs:State.auditLogs,
     baselines:State.baselines, scenarios:State.scenarios, templates:State.templates,
-    technicians:State.technicians, timeSessions:State.timeSessions,
+    technicians:State.technicians, timeSessions:State.timeSessions, skills:State.skills,
     schedules:State.schedules, settings:State.settings, ui:State.ui
   };
 }
@@ -637,9 +646,10 @@ function applySnapshot(s){
   keys.forEach(k=> State[k]=Array.isArray(s[k])?s[k]:[]);
   State.schedules = s.schedules||{};
   State.technicians=State.technicians||[]; State.timeSessions=State.timeSessions||[];
+  State.skills = Array.isArray(s.skills)?s.skills:(State.skills||[]);
   State.settings = Object.assign({}, State.settings, s.settings||{});
   if(s.ui){ State.ui.activeProgram=s.ui.activeProgram||null; State.ui.activeAircraft=s.ui.activeAircraft||null; }
-  normalizeCalendars(); normalizeTasks();
+  normalizeCalendars(); normalizeTasks(); normalizeSkills();
 }
 
 function normalizeTasks(){
@@ -911,6 +921,19 @@ const Engine = (function(){
     return { workMin:Math.max(0,workMin), cureMin, coolMin, totalMin: Math.max(0,workMin)+cureMin+coolMin };
   }
 
+  /* Elapsed phases for COMPLETED work, computed from ACTUAL labour hours and the crew that actually worked
+     (no expected-efficiency factor — actual hours are real). Used to find a task's real finish when the
+     user recorded actual hours but no explicit finish timestamp, so successors gate on the true finish. */
+  function actualPhases(t){
+    let workMin;
+    if(t.fixedDurationHrs!=null && t.fixedDurationHrs>0){ workMin = Math.round(t.fixedDurationHrs*60); }
+    else { const aw = taskActualWorkers(t) || clamp(t.assignedWorkers||1, Math.max(1,t.minWorkers||1), Math.max(t.minWorkers||1,t.maxWorkers||1));
+      workMin = Math.ceil((t.actualLaborHours||0)*60 / Math.max(1,aw)); }
+    const cureMin = Math.round((t.curingDurationHrs||0)*60);
+    const coolMin = Math.round((t.coolingDurationHrs||0)*60);
+    return { workMin:Math.max(0,workMin), cureMin, coolMin, totalMin: Math.max(0,workMin)+cureMin+coolMin };
+  }
+
   /* Build predecessor / successor adjacency for a task set */
   function buildGraph(tasks, deps){
     const ids=new Set(tasks.map(t=>t.id));
@@ -976,7 +999,7 @@ const Engine = (function(){
 
   /* -----------------------------------------------------------------
      Resource-constrained serial schedule generation (SGS).
-     Continuous wall-clock time (robust + deterministic). Honors:
+     Continuous wall-clock time (steady + deterministic). Honors:
        • dependency precedence (FS on Release, SS/FF/SF)
        • labor pool capacity (headcount per skill)
        • equipment capacity (units per type), no double-booking
@@ -1068,11 +1091,39 @@ const Engine = (function(){
       if(ca.floatMin!==cb.floatMin) return ca.floatMin-cb.floatMin;
       const ta=byId(tasks,a)||{priority:0}, tb=byId(tasks,b)||{priority:0}; return (tb.priority||0)-(ta.priority||0); });
     const lineState={};
+    // DATA DATE (status date): once a program has any actual progress, remaining/forecast work cannot
+    // be scheduled in the past. Completed work is pinned to its actual timing so real delays push successors.
+    // DATA DATE (status date): the anchor from which remaining/forecast work is scheduled. Use the
+    // explicit setting if the user set one; otherwise infer it from the FRONT of real actual progress
+    // (latest recorded actual start/finish, or a live check-in). If there are NO actual timestamps at all
+    // \u2014 e.g. the user only typed actual hours and % \u2014 leave it null so the plan is never dragged to
+    // the wall clock. Recording hours/percent alone must not reschedule everything "from now".
+    let dataDate = (State.settings.dataDateMs!=null) ? State.settings.dataDateMs : null;
+    if(dataDate==null){ let m=null;
+      tasks.forEach(t=>{ const af=taskActualFinishMs(t); if(af!=null && (m==null||af>m)) m=af;
+        const as=taskActualStartMs(t); if(as!=null && (m==null||as>m)) m=as; });
+      (State.timeSessions||[]).forEach(s=>{ if(!s.endMs && tasks.some(t=>t.id===s.taskId)){ const v=s.startMs; if(v!=null && (m==null||v>m)) m=v; } });
+      dataDate=m; }
 
     // Each aircraft begins no earlier than its planned-window start date (falls back to the program/project start).
     function acStartFor(id){ const acId=stInfo[id]&&stInfo[id].ac; const ac=acId?byId(State.aircraft,acId):null; return (ac&&ac.plannedStartMs)? ac.plannedStartMs : base; }
     order.forEach(id=>{
       const t=byId(tasks,id); if(!t) return;
+      const _pct=clamp(t.percentComplete||0,0,100); const _done=(t.status==="COMPLETE"||_pct>=100);
+      const _aStart=taskActualStartMs(t), _aFin=taskActualFinishMs(t);
+      const _hasActHrs=(t.actualLaborHours||0)>0 && !((t.fixedDurationHrs||0)>0);
+      const _actW=taskActualWorkers(t)||0;
+      const _useAct = _done || (_pct>0 && _hasActHrs);   // duration driven by ACTUAL labour, not the plan
+      // Effective WORK phases the resource ledger + gating use, so the crew a task really tied up stays
+      // booked and later tasks queue behind an overrun. Completed -> from actual hours; in-progress with
+      // actuals -> actual-so-far + remaining planned; otherwise planned (remaining-scaled when a data date set).
+      function effPhases(w){ const P=taskPhases(t,w); const aw=_actW||w;
+        if(_done && _hasActHrs) return {workMin:Math.max(0,Math.ceil((t.actualLaborHours)*60/Math.max(1,aw))), cureMin:P.cureMin, coolMin:P.coolMin};
+        if(!_done && _pct>0 && _hasActHrs){ const projHrs=Math.max(t.plannedLaborHours||0,(t.actualLaborHours||0)+(t.plannedLaborHours||0)*(1-_pct/100));
+          return {workMin:Math.max(0,Math.ceil(projHrs*60/Math.max(1,aw))), cureMin:P.cureMin, coolMin:P.coolMin}; }
+        const f=(!_done && dataDate!=null)?(1-_pct/100):1;
+        return {workMin:Math.max(0,Math.ceil(P.workMin*f)), cureMin:P.cureMin, coolMin:P.coolMin}; }
+      function rphases(w){ return effPhases(w); }   // probe/candidate code below calls rphases
       const acFloor=acStartFor(id); let eps=acFloor;
       (c.preds[id]||[]).forEach(d=>{ const lag=(d.lagHours||0)*HOUR; const pf=finishMs[d.predecessorId], ps=workStartMs[d.predecessorId];
         if(pf==null||ps==null) return;
@@ -1081,7 +1132,10 @@ const Engine = (function(){
         else if(d.type==="FF") eps=Math.max(eps, pf+lag-approxSpan(t,P,pf));
         else if(d.type==="SF") eps=Math.max(eps, ps+lag-approxSpan(t,P,ps));
       });
-      { const inf=stInfo[id]; const gateThis= gating || (inf&&inf.gated);
+      // Intra-aircraft station sequencing: a station waits for all earlier stations of the SAME aircraft to
+      // release. Always on when stage-gating is enabled, the stage is individually gated, OR a production
+      // line is active (a line is a relay — each aircraft flows through its stations in order).
+      { const inf=stInfo[id]; const gateThis= gating || (inf&&inf.gated) || (lineMode!=="off");
         if(gateThis && inf && inf.ac!=null){ const sm=stageMax[inf.ac]||{};
           Object.keys(sm).forEach(k=>{ if(+k<inf.seq) eps=Math.max(eps, sm[k]); }); } }
       if(lineMode!=="off"){ const inf=stInfo[id]; const g=inf.grp||"ALL"; let ls=lineState[g];
@@ -1090,6 +1144,7 @@ const Engine = (function(){
           ls.prevAcFinish=mx; ls.prevStationRelease=ls.curStationRelease; ls.curStationRelease={}; ls.curBi=inf.bi; }
         if(inf.bi>0){ if(lineMode==="serial") eps=Math.max(eps, ls.prevAcFinish||0);
           else if(lineMode==="pulse") eps=Math.max(eps, ls.prevStationRelease[inf.seq]||0); } }
+      if(!_done && dataDate!=null) eps=Math.max(eps, dataDate);
       eps=WorkCal.nextWorkingStart(cal, Math.max(eps,acFloor));
 
       // Resource-aware worker allocation. FIXED honours assignedWorkers; OPTIMIZE puts
@@ -1097,32 +1152,44 @@ const Engine = (function(){
       // and the next station is unblocked earlier — maximising utilisation, cutting idle time.
       const mn=Math.max(1,t.minWorkers||1), mx=Math.max(mn,t.maxWorkers||mn);
       const optimize = (!!(program&&program.optimizeLabor) || t.allocationMode==="OPTIMIZE") && (t.plannedLaborHours||0)>0 && !((t.fixedDurationHrs||0)>0);
-      const fixedW=clamp(t.assignedWorkers||mn, mn, mx); const labKey=bookKey("LABOR",t.laborSkill); const labCap=laborCap[t.laborSkill]||0;
-      function workersAt(ws){ if(!optimize) return fixedW; const free=labCap - maxConcurrent(labKey, ws, ws+MIN); return free>=mn? clamp(free,mn,mx) : mn; }
+      const fixedW = (_useAct && _actW>0) ? Math.max(1,_actW) : clamp(t.assignedWorkers||mn, mn, mx);
+      const labKey=bookKey("LABOR",t.laborSkill); const labCap=laborCap[t.laborSkill]||0;
+      function workersAt(ws){ if(_useAct) return fixedW; if(!optimize) return fixedW; const free=labCap - maxConcurrent(labKey, ws, ws+MIN); return free>=mn? clamp(free,mn,mx) : mn; }
 
-      const probeW= optimize? mn : fixedW; const probeP=taskPhases(t,probeW); const probeB=bookings(t,probeP,layout(t,probeP,eps),probeW);
+      const probeW= optimize? mn : fixedW; const probeP=rphases(probeW); const probeB=bookings(t,probeP,layout(t,probeP,eps),probeW);
       const candSet=new Set([eps]);
       probeB.forEach(bk=>{ const arr=ledger[bk.key]; if(!arr) return; for(let bi=0;bi<arr.length;bi++){ const b=arr[bi]; if(b.e>=eps) candSet.add(WorkCal.nextWorkingStart(cal,b.e)); } });
       const candidates=[...candSet].filter(x=>x>=eps).sort((a,b)=>a-b).slice(0,400);
 
       let chosen=null,cl=null,cb=null,cP=null,cw=fixedW;
-      for(const ws of candidates){ const w=workersAt(ws); const P=taskPhases(t,w); const L=layout(t,P,ws); const B=bookings(t,P,L,w);
+      for(const ws of candidates){ const w=workersAt(ws); const P=rphases(w); const L=layout(t,P,ws); const B=bookings(t,P,L,w);
         let ok=true; for(const bk of B){ if(!feasible(bk.key,bk.cap,bk.intervals,bk.units)){ ok=false; break; } }
         if(ok){ chosen=ws; cl=L; cb=B; cP=P; cw=w; break; } }
-      if(chosen==null){ const w=optimize?mn:fixedW; cP=taskPhases(t,w); cl=layout(t,cP,eps); cb=bookings(t,cP,cl,w); cw=w; chosen=eps; }
+      if(chosen==null){ const w=optimize?mn:fixedW; cP=rphases(w); cl=layout(t,cP,eps); cb=bookings(t,cP,cl,w); cw=w; chosen=eps; }
 
       cb.forEach(bk=>{ book(bk.key,bk.intervals,bk.units);
         bk.intervals.forEach(iv=>assignments.push({id:uid("asg"),taskId:id,resourceKind:bk.kind,resourceId:bk.res,startMs:iv.s,endMs:iv.e,units:bk.units,phase:bk.phase})); });
 
-      workStartMs[id]=cl.workStart; finishMs[id]=cl.coolEnd; placed[id]=true;
+      // In-progress overrun: project the release from the ACTUAL pace (actual hours \u00f7 fraction done) so a
+      // task already over budget pushes its successors. The plan bar stays at planned length (relMs only
+      // affects gating, not the drawn bar), and the plan/actual overlay shows the overrun.
+      // cl/cb already reflect the EFFECTIVE (actual) duration and have BOOKED the real crew, so later
+      // tasks queue behind an overrun. Successors gate on this real release; an explicit actual finish wins.
+      let relMs=cl.coolEnd; if(_aFin!=null) relMs=Math.max(relMs,_aFin);
+      workStartMs[id]=cl.workStart; finishMs[id]=relMs; placed[id]=true;
       { const inf=stInfo[id]; if(inf && inf.ac!=null){ (stageMax[inf.ac]=stageMax[inf.ac]||{});
-        stageMax[inf.ac][inf.seq]=Math.max(stageMax[inf.ac][inf.seq]||0, cl.coolEnd); } }
-      if(lineMode!=="off"){ const inf=stInfo[id]; const ls=lineState[inf.grp||"ALL"]; if(ls){ ls.curStationRelease[inf.seq]=Math.max(ls.curStationRelease[inf.seq]||0, cl.coolEnd); } }
+        stageMax[inf.ac][inf.seq]=Math.max(stageMax[inf.ac][inf.seq]||0, relMs); } }
+      if(lineMode!=="off"){ const inf=stInfo[id]; const ls=lineState[inf.grp||"ALL"]; if(ls){ ls.curStationRelease[inf.seq]=Math.max(ls.curStationRelease[inf.seq]||0, relMs); } }
       const cc=c.cpm[id]; const floatMs=cc.floatMin*MIN;
-      taskSchedules.push({ taskId:id, startMs:cl.workStart, finishMs:cl.coolEnd,
-        workEndMs:cl.workEnd, cureEndMs:cl.cureEnd, coolEndMs:cl.coolEnd,
-        earlyStartMs:cl.workStart, earlyFinishMs:cl.coolEnd, lateStartMs:cl.workStart+floatMs, lateFinishMs:cl.coolEnd+floatMs,
-        totalFloatMin:cc.floatMin, onCriticalPath:cc.critical, workMin:cP.workMin, cureMin:cP.cureMin, coolMin:cP.coolMin, workers:cw });
+      // The drawn bar uses the PLANNED layout at the placed start, so the plan bar never grows to the actual
+      // overrun; the plan/actual overlay renders the overrun separately. actualFinishMs carries the real release.
+      const _pp=taskPhases(t,cw); const _planL=layout(t,_pp,cl.workStart);
+      const _dispStart=(_useAct && _aStart!=null)? Math.min(_aStart, _planL.workStart) : _planL.workStart;
+      taskSchedules.push({ taskId:id, startMs:_dispStart, finishMs:_planL.coolEnd,
+        workEndMs:_planL.workEnd, cureEndMs:_planL.cureEnd, coolEndMs:_planL.coolEnd,
+        earlyStartMs:_planL.workStart, earlyFinishMs:_planL.coolEnd, lateStartMs:_planL.workStart+floatMs, lateFinishMs:_planL.coolEnd+floatMs,
+        totalFloatMin:cc.floatMin, onCriticalPath:cc.critical, workMin:_pp.workMin, cureMin:_pp.cureMin, coolMin:_pp.coolMin, workers:cw,
+        actual:_useAct, complete:_done, percentComplete:_pct, actualStartMs:_aStart, actualFinishMs:_useAct?relMs:null });
     });
 
     const unplaced=tasks.filter(t=>!placed[t.id] && !c.cyclic.includes(t.id));
@@ -1273,19 +1340,32 @@ const Analytics = (function(){
       const act=sum(tasks,t=>t.actualLaborHours||0);
       const earned=sum(tasks,t=>(t.plannedLaborHours||0)*(t.percentComplete||0)/100);
       const pct= tasks.length? round(sum(tasks,t=>t.percentComplete||0)/tasks.length,0):0;
-      const winHrs= workingHoursBetween(cal, ac.plannedStartMs, ac.plannedFinishMs);
       const avgCrew= std>0? sum(tasks,t=>(t.plannedLaborHours||0)*Math.max(1,t.assignedWorkers||1))/std : 1;
-      const capHrs= winHrs*avgCrew;
-      const requiredEff= capHrs>0? round(std/capHrs*100,0): null;
-      const achievedEff= act>0? round(earned/act*100,0): null;
       const starts=tasks.map(t=>map[t.id]&&map[t.id].startMs).filter(Boolean);
       const fins=tasks.map(t=>map[t.id]&&map[t.id].finishMs).filter(Boolean);
+      const schedStartMs= starts.length?Math.min(...starts):null;
+      const schedFinishMs= fins.length?Math.max(...fins):null;
+      const deadline= ac.plannedFinishMs||null;
+      // Required efficiency = the pace (relative to standard) needed to fit the SCHEDULED work span
+      // into the PLANNED window. The scheduler builds the span at the program's expected efficiency;
+      // scaling it to the window gives expectedEff x schedSpan / window. Because schedSpan reflects the
+      // real schedule, this responds to sequence changes, stage gating on/off, parallel stages and line
+      // mode. When the window equals the scheduled span, required efficiency equals the expected pace.
+      const winHrs= workingHoursBetween(cal, ac.plannedStartMs, deadline);
+      const schedSpanHrs= (schedStartMs!=null && schedFinishMs!=null && schedFinishMs>schedStartMs)? workingHoursBetween(cal, schedStartMs, schedFinishMs) : null;
+      const requiredEff= (schedSpanHrs!=null && winHrs>0)? round(expectedEff * schedSpanHrs / winHrs, 0) : (std>0? null : 0);
+      const capHrs= round(winHrs*avgCrew,0);
+      const achievedEff= act>0? round(earned/act*100,0): null;
       const complete= tasks.length>0 && tasks.every(t=>t.status==="COMPLETE");
+      // On-plan check: does the scheduled finish meet the planned deadline?
+      const onPlan= (schedFinishMs!=null && deadline)? (schedFinishMs<=deadline) : null;
+      const overrunDays= (schedFinishMs!=null && deadline)? round((schedFinishMs-deadline)/DAY,0) : null;
+      const pastDeadline= (schedFinishMs!=null && deadline)? (schedFinishMs>deadline) : false;
       return { id:ac.id, unit:idx+1, serial:ac.serialNumber, model:ac.model, taskCount:tasks.length,
         std:round(std,0), act:round(act,0), earned:round(earned,0), pct,
         requiredEff, achievedEff, winHrs:round(winHrs,0), capHrs:round(capHrs,0), avgCrew:round(avgCrew,1),
         plannedStartMs:ac.plannedStartMs, plannedFinishMs:ac.plannedFinishMs,
-        schedStartMs: starts.length?Math.min(...starts):null, schedFinishMs: fins.length?Math.max(...fins):null, complete };
+        schedStartMs, schedFinishMs, schedSpanHrs: schedSpanHrs==null?null:round(schedSpanHrs,0), onPlan, overrunDays, pastDeadline, complete };
     });
     const totStd=sum(units,u=>u.std), totAct=sum(units,u=>u.act), totEarned=sum(units,u=>u.earned);
     const progAchieved= totAct>0? round(totEarned/totAct*100,0): null;
@@ -1606,7 +1686,12 @@ const Gantt2 = (function(){
       let labelEnd=kEnd;
       if(hasA){
         const ay=y+ROWH-7, ah=4.4; const plannedPx=Math.max(2,kEnd-bx);
-        const ratio=clamp(r.actRatio||0,0,2.8); const aw=Math.max(2,plannedPx*ratio);
+        // The actual/forecast bar runs to the REAL release time, so an overrun visibly occupies the lane right
+        // up to where the next task is gated to begin — no more mystery gap. Fall back to a ratio width.
+        let aEnd;
+        if(r.actualFinishMs!=null) aEnd=clamp(xOf(r.actualFinishMs), bx+2, cur.timelineW);
+        else { const ratio=clamp(r.actRatio||0,0,2.8); aEnd=bx+Math.max(2,plannedPx*ratio); }
+        const aw=Math.max(2, aEnd-bx);
         ctx.strokeStyle=cv("--line-2"); ctx.setLineDash([2,2]); ctx.strokeRect(bx+0.5,ay+0.5,plannedPx-1,ah-1); ctx.setLineDash([]);
         const acol= r.done? (r.actLate? cv("--red") : cv("--green")) : cv("--amber");
         ctx.fillStyle=acol; rr(ctx,bx,ay,aw,ah,2); ctx.fill();
@@ -1791,13 +1876,22 @@ const Gantt2 = (function(){
       if(t.cureEndMs!=null && t.finishMs>t.cureEndMs && t.cureEndMs<ce && t.finishMs>cs) return "cool";
       return null;
     }
-    function cellFor(t,cs){ const ce=cs+SLOT*MIN; const ph=phaseAt(t,cs,ce);
-      if(ph==="work") return '<td class="slot work"><span class="ck"></span></td>';
-      if(ph==="cure") return '<td class="slot cure"></td>';
-      if(ph==="cool") return '<td class="slot cool"></td>';
+    function cellFor(t,cs){ const ce=cs+SLOT*MIN; const ph=phaseAt(t,cs,ce); const brk=isBreakMs(cs);
+      if(ph==="cure") return '<td class="slot cure"></td>';   // oven keeps running through the break
+      if(ph==="cool") return '<td class="slot cool"></td>';   // rack cooling keeps running
+      if(ph==="work") return brk? '<td class="slot brk"></td>' : '<td class="slot work"><span class="ck"></span></td>';
+      if(brk) return '<td class="slot brk"></td>';
       return '<td class="slot"></td>'; }
-    function groupByStage(list){ const by={}, order=[]; list.slice().sort((a,b)=>a.startMs-b.startMs||String(a.wbs).localeCompare(String(b.wbs),undefined,{numeric:true}))
-        .forEach(t=>{ const sg=t.stage||"Tasks"; if(!by[sg]){ by[sg]=[]; order.push(sg);} by[sg].push(t); }); return {by,order}; }
+    // Preserve the EXACT order shown on the Gantt (stage sequence + task order),
+    // so a later-sequence stage that starts early prints in its Gantt position,
+    // not reshuffled to the top by start time.
+    const orderedAll=[]; { let g=null; cur.rows.forEach(r=>{ if(r.isGroup){ g={name:r.label,tasks:[]}; orderedAll.push(g); }
+      else if(r.startMs!=null && r.finishMs!=null){ if(!g){ g={name:r.stage||"Tasks",tasks:[]}; orderedAll.push(g); } g.tasks.push(r); } }); }
+    function orderedFor(keep){ return orderedAll.map(g=>({name:g.name, tasks:g.tasks.filter(keep)})).filter(g=>g.tasks.length); }
+    // break windows (from the calendar shifts) so the board shows the meal/prayer break
+    const breaks=[]; if(cal && cal.shifts) cal.shifts.forEach(sh=>{ if(sh.breakStartMin!=null && sh.breakEndMin!=null && sh.breakEndMin>sh.breakStartMin) breaks.push([sh.breakStartMin,sh.breakEndMin]); });
+    function isBreak(min){ return breaks.some(function(p){ return min < p[1] && (min+SLOT) > p[0]; }); }
+    function isBreakMs(cs){ return isBreak(Math.round((cs-dayMid(cs))/MIN)); }
 
     const sMin=Math.min.apply(null,tasks.map(t=>t.startMs)), fMax=Math.max.apply(null,tasks.map(t=>t.finishMs));
     const d0=dayMid(sMin), dEnd=dayMid(fMax);
@@ -1811,12 +1905,12 @@ const Gantt2 = (function(){
       for(let d=d0; d<=dEnd && days.length<MAXDAYS; d+=DAY){ const wStart=d+dayStartMin*MIN, wEnd=d+dayEndMin*MIN;
         const active=tasks.filter(t=>t.startMs<wEnd && t.finishMs>wStart); if(active.length) days.push({d,active}); }
       if(!days.length){ toast("No working-hour activity to board"); return; }
-      const slotHdr=slotMins.map(m=>'<th class="slot'+(m%60===0?' hr':'')+'">'+hm(m)+'</th>').join("");
+      const slotHdr=slotMins.map((m,i)=>'<th class="slot'+(m%60===0?' hr':'')+(isBreak(m)?' brk':'')+'">'+hm(m)+(i===slotMins.length-1?'<span class="endh">\u2013'+hm(dayEndMin)+'</span>':'')+'</th>').join("");
       days.forEach((day,di)=>{
         const dlabel=new Date(day.d).toLocaleDateString(undefined,{weekday:"long",year:"numeric",month:"short",day:"numeric"});
-        const g=groupByStage(day.active); let body="";
-        g.order.forEach(sg=>{ body+='<tr class="stg"><td colspan="4">'+esc(sg)+'</td>'+slotMins.map(()=>'<td class="slot"></td>').join("")+'<td></td><td></td></tr>';
-          g.by[sg].forEach(t=>{ const cells=slotMins.map(m=>cellFor(t,day.d+m*MIN)).join("");
+        const groups=orderedFor(t=>t.startMs<(day.d+dayEndMin*MIN) && t.finishMs>(day.d+dayStartMin*MIN)); let body="";
+        groups.forEach(grp=>{ body+='<tr class="stg"><td colspan="4">'+esc(grp.name)+'</td>'+slotMins.map(m=>'<td class="slot'+(isBreak(m)?' brk':'')+'"></td>').join("")+'<td></td><td></td></tr>';
+          grp.tasks.forEach(t=>{ const cells=slotMins.map(m=>cellFor(t,day.d+m*MIN)).join("");
             const win=hmAt(t.startMs)+"\u2013"+hmAt(t.finishMs); const nm=(t.critical?'\u25C6 ':'')+esc(t.label);
             body+='<tr'+(t.critical?' class="crit"':'')+'><td class="wbs">'+esc(t.wbs||"")+'</td><td class="nm">'+nm+'</td><td class="c">'+(t.crew||"")+'</td><td class="c win">'+win+'</td>'+cells+'<td class="pct">'+(t.pct?('<s>'+t.pct+'%</s>'):'')+'</td><td class="sign"></td></tr>'; }); });
         inner+='<div class="page'+(di<days.length-1?' brk':'')+'"><div class="dhd"><span class="dn">'+esc(dlabel)+'</span> \u2014 '+esc(ap?ap.name:"")+(acName?" \u00b7 "+esc(acName):"")+' \u00b7 day '+(di+1)+' of '+days.length+'</div>'+
@@ -1833,11 +1927,11 @@ const Gantt2 = (function(){
       const truncated= cols.length>=MAXCOLS;
       // day header row (group columns per day)
       let dayHdr=""; let i=0; while(i<cols.length){ let j=i; while(j<cols.length && cols[j].day===cols[i].day) j++; dayHdr+='<th class="dayh" colspan="'+(j-i)+'">'+dfmt(cols[i].day)+'</th>'; i=j; }
-      const timeHdr=cols.map(c=>'<th class="slot'+(c.min%60===0?' hr':'')+(c.dayStart?' dsep':'')+'">'+hm(c.min)+'</th>').join("");
+      const timeHdr=cols.map((c,i)=>{ const dayEnd=(i===cols.length-1)||(cols[i+1]&&cols[i+1].dayStart); return '<th class="slot'+(c.min%60===0?' hr':'')+(c.dayStart?' dsep':'')+(isBreak(c.min)?' brk':'')+'">'+hm(c.min)+(dayEnd?'<span class="endh">\u2013'+hm(dayEndMin)+'</span>':'')+'</th>'; }).join("");
       const winTasks=tasks.filter(t=>t.startMs<cols[cols.length-1].ms+SLOT*MIN && t.finishMs>cols[0].ms);
-      const g=groupByStage(winTasks); let body="";
-      g.order.forEach(sg=>{ body+='<tr class="stg"><td colspan="3">'+esc(sg)+'</td>'+cols.map(c=>'<td class="slot'+(c.dayStart?' dsep':'')+'"></td>').join("")+'<td></td><td></td></tr>';
-        g.by[sg].forEach(t=>{ const cells=cols.map(c=>{ let cell=cellFor(t,c.ms); if(c.dayStart) cell=cell.replace('class="slot','class="slot dsep'); return cell; }).join("");
+      const groups=orderedFor(t=>t.startMs<cols[cols.length-1].ms+SLOT*MIN && t.finishMs>cols[0].ms); let body="";
+      groups.forEach(grp=>{ body+='<tr class="stg"><td colspan="3">'+esc(grp.name)+'</td>'+cols.map(c=>'<td class="slot'+(c.dayStart?' dsep':'')+(isBreak(c.min)?' brk':'')+'"></td>').join("")+'<td></td><td></td></tr>';
+        grp.tasks.forEach(t=>{ const cells=cols.map(c=>{ let cell=cellFor(t,c.ms); if(c.dayStart) cell=cell.replace('class="slot','class="slot dsep'); return cell; }).join("");
           const nm=(t.critical?'\u25C6 ':'')+esc(t.label);
           body+='<tr'+(t.critical?' class="crit"':'')+'><td class="wbs">'+esc(t.wbs||"")+'</td><td class="nm">'+nm+'</td><td class="c">'+(t.crew||"")+'</td>'+cells+'<td class="pct">'+(t.pct?('<s>'+t.pct+'%</s>'):'')+'</td><td class="sign"></td></tr>'; }); });
       inner='<div class="cont"><table class="board"><thead>'+
@@ -1852,7 +1946,7 @@ const Gantt2 = (function(){
       '.brand{display:flex;align-items:baseline;gap:10px;border-bottom:2px solid #2563eb;padding-bottom:7px;margin-bottom:9px}'+
       '.brand h1{font-size:15px;margin:0}.brand .tag{font-size:10px;color:#2563eb;font-weight:700;letter-spacing:.5px}.brand .s{font-size:10.5px;color:#5b6b7e;margin-left:auto}'+
       '.legend{display:flex;gap:14px;font-size:10px;color:#46566a;margin:0 0 9px;flex-wrap:wrap}.legend i{display:inline-block;width:12px;height:11px;border:1px solid #cbd5e1;margin-right:4px;vertical-align:-1px}'+
-      '.legend .w{background:#dbeafe}.legend .cu{background:#ffedd5}.legend .co{background:#fef9c3}'+
+      '.legend .w{background:#dbeafe}.legend .cu{background:#ffedd5}.legend .co{background:#fef9c3}.legend .br{background-image:repeating-linear-gradient(45deg,#dfe5ec 0 2px,#f4f6f9 2px 5px)}'+
       '.page.brk{page-break-after:always}.dhd{font-size:11px;margin:8px 0 4px;color:#1f2d3d}.dhd .dn{font-weight:700}'+
       '.cont{overflow:visible}'+
       'table.board{border-collapse:collapse;width:100%;table-layout:fixed}'+
@@ -1862,6 +1956,8 @@ const Gantt2 = (function(){
       'th.slot{font-size:7px;writing-mode:vertical-rl;transform:rotate(180deg);height:32px}th.slot.hr{background:#dbe3ee;font-weight:700}'+
       'td.slot.dsep,th.slot.dsep{border-left:2px solid #94a3b8}'+
       'td.slot.work{background:#dbeafe}td.slot.cure{background:#ffedd5}td.slot.cool{background:#fef9c3}'+
+      'td.slot.brk,th.slot.brk{background-image:repeating-linear-gradient(45deg,#dfe5ec 0 2px,#f4f6f9 2px 5px);color:#8a98a8}'+
+      'th.slot .endh{display:block;font-size:6.5px;font-weight:700;color:#0f172a;line-height:1}'+
       '.ck{display:inline-block;width:9px;height:9px;border:1px solid #475569;border-radius:2px;margin-top:3px}'+
       'td.wbs,th.wbs{width:32px}td.nm,th.nm{width:148px;text-align:left;white-space:nowrap;text-overflow:ellipsis}td.c,th.c{width:28px;text-align:center}td.win{font-size:7.5px;color:#475569}'+
       'td.pct,th.pct{width:40px;text-align:center}td.sign,th.sign{width:38px}td.pct s{color:#94a3b8;text-decoration:none;font-size:7.5px}'+
@@ -1912,10 +2008,11 @@ const VIEW_HELP={
   templates:"<b>Reusable blueprints.</b> Capture an aircraft\u2019s stage/task plan once, then apply it to other tails to avoid re-keying. <b>Duplicate</b> to branch a variant.",
   line:"<b>Production line \u2014 the relay view.</b> See which aircraft is at which station and how far along each is. Turn on <b>line gating</b> to sequence tails: <b>Serial</b> finishes SN1 before SN2 starts; <b>Pulse</b> lets SN2 enter a station as soon as SN1 leaves it (a true flow line). Scope the line to the whole program or per model. Use \u25B2/\u25BC to set build order, then Recalculate.",
   checkin:"<b>Shop-floor time tracking.</b> Add technicians, then <b>check in</b> to a task to start a timer; <b>Check out</b> or <b>Complete</b> stops it and logs the time to the task\u2019s actual labor hours (feeding efficiency &amp; the learning curve). No QR needed \u2014 it works on any device. Optionally <b>Print QR labels</b> and, when online, <b>Scan QR</b> to check in by camera.",
-  efficiency:"<b>Labor efficiency &amp; the serial-build learning curve.</b> <b>Required</b> efficiency is the productivity needed to fit each tail\u2019s work into its planned window; <b>achieved</b> is earned \u00f7 actual labor once you log progress. Record <b>Actual labor</b> &amp; <b>% complete</b> per task, then watch hours-per-unit fall across serial builds and read the fitted learning rate, projection &amp; analysis.",
+  efficiency:"<b>Labor efficiency &amp; the serial-build learning curve.</b> <b>Required</b> efficiency is the pace needed to fit each tail\u2019s scheduled build into its planned window \u2014 it equals your expected pace when the window matches the schedule, and rises above it when the window is too short; <b>achieved</b> is earned \u00f7 actual labor once you log progress. Record <b>Actual labor</b> &amp; <b>% complete</b> per task, then watch hours-per-unit fall across serial builds and read the fitted learning rate, projection &amp; analysis.",
   audit:"<b>Traceable change history.</b> Every create/update/delete is timestamped here, newest first \u2014 useful for AS9100-style records."
 };
 function render(){
+  if(typeof normalizeSkills==="function") normalizeSkills();
   const m=State.ui.module;
   if(typeof ciStopTimer==="function") ciStopTimer();
   els.root.innerHTML = shellHTML();
@@ -2023,6 +2120,13 @@ function viewDashboard(){
   const bn=Analytics.bottlenecks(pid);
   const conflicts=(sched&&sched.conflicts)||[];
 
+  const _behind={}; acs.forEach(a=>{ const stt=acStatus(a.id); if(stt.behind && !stt.released) _behind[stt.currentStation]=true; });
+  const _flow=programFlow(pid);
+  const dashStationRows=_flow.map((stn,i)=>{ const mh=stationManHoursFleet(pid,stn.name);
+    let label,cls; if(stn.status==="complete"){label="Completed";cls="ok";} else if(_behind[stn.name]){label="Delayed";cls="err";} else if(stn.status==="active"){label="In Progress";cls="info";} else {label="Not Started";cls="";}
+    const col= stn.pct>=100?"var(--green)":stn.pct>=50?"var(--accent)":stn.pct>0?"var(--amber)":"var(--line-2)";
+    return `<div class="pdash-row"><div class="pdash-name" title="${esc(stn.name)}">${i+1}. ${esc(stn.name)}${mh>0?` <span class="muted" style="font-size:10.5px">\u00b7 ${mh} man-h</span>`:""}</div><div class="pdash-bar"><div class="pdash-fill" style="width:${stn.pct}%;background:${col}"></div></div><div class="pdash-pct" style="color:${col}">${stn.pct}%</div><div class="pdash-chip"><span class="chip ${cls}">${label}</span></div></div>`; }).join("");
+  const _lc=Analytics.learningCurve(pid);
   return viewHead("Dashboard", esc(ap.name)+" · "+esc(ap.code)) + `
     ${conflicts.length? `<div class="inline-warn ${conflicts.some(c=>c.severity==='err')?'err':''}">${icon("alert")}
       <div><b>${conflicts.length} scheduling conflict(s).</b> ${esc(conflicts[0].msg)} ${conflicts.length>1?`<span class="muted">(+${conflicts.length-1} more in Scheduling)</span>`:""}</div></div>`:""}
@@ -2049,6 +2153,17 @@ function viewDashboard(){
       <div class="panel">
         <div class="panel-h"><span class="eyebrow">Equipment</span><h3>Peak Loading</h3></div>
         <div class="panel-b">${eqRows.length?Chart.hbars(eqRows,{unit:"%"}):'<span class="muted">No equipment data</span>'}</div>
+      </div>
+    </div>
+
+    <div class="grid cols-2" style="margin-top:14px">
+      <div class="panel">
+        <div class="panel-h"><span class="eyebrow">Stations</span><h3>Station status &amp; man-hours</h3><span class="spacer"></span><span class="muted" style="font-size:11px">${_flow.length} stations</span></div>
+        <div class="panel-b">${dashStationRows||'<span class="muted">No stations yet</span>'}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-h"><span class="eyebrow">Efficiency</span><h3>Learning curve</h3><span class="spacer"></span>${_lc.enough?`<span class="muted" style="font-size:11px">${_lc.LR}% rate</span>`:""}</div>
+        <div class="panel-b">${_lc.enough? `<canvas id="dash-lc" style="width:100%;height:220px"></canvas><div class="muted" style="font-size:11px;margin-top:6px">Labor per unit is dropping about ${_lc.slopePct}% each time output doubles.</div>` : `<div class="empty" style="padding:24px">${icon("chart","ico")}<h4>Not enough built units yet</h4><p class="muted">Finish 2+ aircraft and the learning curve (and projected hours for the next tails) appears here.</p></div>`}</div>
       </div>
     </div>
 
@@ -2177,7 +2292,7 @@ function viewScheduling(){
       <div class="val" style="font-size:20px;display:flex;align-items:center;gap:6px">
         <input type="number" min="10" max="200" step="5" value="${expEff}" data-act="set-expected-eff" style="width:64px;background:var(--panel-2);border:1px solid var(--line-2);color:var(--ink);border-radius:6px;padding:3px 6px;font-size:18px;font-weight:700">%
       </div><div class="meta">planning pace \u2014 the whole schedule recalculates from this</div></div>
-    <div class="kpi k-blue" style="padding:9px 12px"><div class="label">Required Efficiency</div><div class="val" style="font-size:20px">${!effUnit||effUnit.requiredEff==null?"\u2014":effUnit.requiredEff+"<span class='unit'>%</span>"}</div><div class="meta">productivity needed to fit ${effUnit?esc(effUnit.serial):"this tail"} into its planned window</div></div>
+    <div class="kpi k-blue" style="padding:9px 12px"><div class="label">Required Efficiency</div><div class="val" style="font-size:20px">${!effUnit||effUnit.requiredEff==null?"\u2014":effUnit.requiredEff+"<span class='unit'>%</span>"}</div><div class="meta">pace to fit ${effUnit?esc(effUnit.serial):"this tail"}\u2019s schedule into its planned window</div></div>
     <div class="kpi ${effUnit&&effUnit.achievedEff!=null?(effUnit.requiredEff!=null&&effUnit.achievedEff<effUnit.requiredEff?'k-red':effUnit.achievedEff>=100?'k-green':'k-amber'):''}" style="padding:9px 12px"><div class="label">Current Efficiency</div><div class="val" style="font-size:20px">${!effUnit||effUnit.achievedEff==null?"\u2014":effUnit.achievedEff+"<span class='unit'>%</span>"}</div><div class="meta">earned \u00f7 actual labor${effUnit&&effUnit.achievedEff!=null?" \u00b7 "+effUnit.pct+"% complete":" \u2014 log actuals on tasks"} \u00b7 <a data-act="nav" data-mod="efficiency" style="color:var(--accent);cursor:pointer">details</a></div></div>
   </div>`;
 
@@ -2311,10 +2426,10 @@ postRender.scheduling=function(){
     let list=items; if(critOnly){ list=items.filter(o=>o.s.onCriticalPath); if(!list.length) return; }
     const collapsed=!!collapsedG[st.id];
     const spanStart=Math.min(...items.map(o=>o.s.startMs)), spanEnd=Math.max(...items.map(o=>o.s.finishMs));
-    rows.push({isGroup:true,label:st.name,stageId:st.id,collapsed,count:items.length,stageStartMs:spanStart,stageEndMs:spanEnd});
+    const _mh=round(sum(items,o=>_manH(o.t)),0); rows.push({isGroup:true,label:st.name+(_mh>0?"   \u00b7   "+_mh+" man-h":""),stageId:st.id,collapsed,count:items.length,stageStartMs:spanStart,stageEndMs:spanEnd});
     if(!collapsed) list.forEach(o=>{ const t=o.t, sc=o.s;
       const preds=State.dependencies.filter(d=>d.taskId===t.id).map(d=>{const p=byId(State.tasks,d.predecessorId);return p?(p.wbsCode+" "+p.name+" ("+(DEP_LABEL[d.type]||d.type)+(d.lagHours?" +"+d.lagHours+"h":"")+")"):null;}).filter(Boolean);
-      const A=taskActual(t,sc); rows.push({taskId:t.id,label:t.wbsCode+" "+t.name,stage:st.name,startMs:sc.startMs,workEndMs:sc.workEndMs,cureEndMs:sc.cureEndMs,finishMs:sc.finishMs,critical:sc.onCriticalPath,done:t.status==="COMPLETE",preds,workMin:sc.workMin,cureMin:sc.cureMin,coolMin:sc.coolMin,hasActual:A.hasActual,pct:A.pct,inProgress:A.inProgress,actRatio:A.actRatio,actMin:A.actMin,deltaH:A.deltaH,actLate:A.actLate,crew:t.assignedWorkers,wbs:t.wbsCode,skill:t.laborSkill}); });
+      const A=taskActual(t,sc); rows.push({taskId:t.id,label:t.wbsCode+" "+t.name,stage:st.name,startMs:sc.startMs,workEndMs:sc.workEndMs,cureEndMs:sc.cureEndMs,finishMs:sc.finishMs,critical:sc.onCriticalPath,done:t.status==="COMPLETE",preds,workMin:sc.workMin,cureMin:sc.cureMin,coolMin:sc.coolMin,hasActual:A.hasActual,pct:A.pct,inProgress:A.inProgress,actRatio:A.actRatio,actMin:A.actMin,deltaH:A.deltaH,actLate:A.actLate,actualFinishMs:sc.actualFinishMs,crew:t.assignedWorkers,wbs:t.wbsCode,skill:t.laborSkill}); });
   }); }
   const host=document.getElementById("gantt2-host"); if(host) Gantt2.build(host, rows, {calId: activeCalendarId(ap.id)});
 };
@@ -2414,25 +2529,32 @@ function acStatus(acId){
 }
 function buildOrder(acs){ return acs.slice().sort((x,y)=> ((x.buildSeq||0)-(y.buildSeq||0)) || ((x.plannedStartMs||0)-(y.plannedStartMs||0)) || String(x.serialNumber||"").localeCompare(String(y.serialNumber||""),undefined,{numeric:true})); }
 function _flowW(t){ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; }
+function _manH(t){ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:0; }
+function stageManHours(stageId){ return round(sum(State.tasks.filter(t=>t.stageId===stageId),_manH),0); }
+/* ---- Actuals derived from check-in time sessions (fall back to manual fields) ---- */
+function taskActualStartMs(t){ let m=null; (State.timeSessions||[]).forEach(s=>{ if(s.taskId===t.id && s.startMs!=null) m=(m==null?s.startMs:Math.min(m,s.startMs)); }); if(m==null && t.actualStartMs) m=t.actualStartMs; return m; }
+function taskActualFinishMs(t){ const done=(t.status==="COMPLETE"||(t.percentComplete||0)>=100); if(!done) return null; let m=null; (State.timeSessions||[]).forEach(s=>{ if(s.taskId===t.id && s.endMs!=null) m=(m==null?s.endMs:Math.max(m,s.endMs)); }); if(m==null && t.actualFinishMs) m=t.actualFinishMs; return m; }
+function taskActualWorkers(t){ let mx=0; (State.timeSessions||[]).forEach(s=>{ if(s.taskId===t.id) mx=Math.max(mx, s.workers||1); }); return mx; }
+function stationManHoursFleet(pid,name,acsArg){ const acs=acsArg||State.aircraft.filter(a=>a.programId===pid); let h=0; acs.forEach(a=>{ const st=State.stages.find(s=>s.aircraftId===a.id&&s.name===name); if(st) h+=sum(State.tasks.filter(t=>t.stageId===st.id),_manH); }); return round(h,0); }
 function stationFlow(acId){ const sts=State.stages.filter(s=>s.aircraftId===acId).sort((a,b)=>a.sequence-b.sequence);
   return sts.map(st=>{ const tk=State.tasks.filter(t=>t.stageId===st.id); const tw=sum(tk,_flowW);
     const pct= tw? round(sum(tk,t=>_flowW(t)*(t.percentComplete||0))/tw,0):0;
     const anyStarted= tk.some(t=>(t.percentComplete||0)>0 || (t.status&&t.status!=="NOT_STARTED"));
     const status= (tk.length && pct>=100)?"complete":(anyStarted?"active":"pending");
     return {name:st.name, pct, status}; }); }
-function stationFlowFleet(programId, stName){ const acs=State.aircraft.filter(a=>a.programId===programId);
+function stationFlowFleet(programId, stName, acsArg){ const acs=acsArg||State.aircraft.filter(a=>a.programId===programId);
   let pctSum=0,cnt=0,anyAct=false,allComplete=true;
-  acs.forEach(a=>{ const st=State.stages.find(s=>s.aircraftId===a.id&&s.name===stName); if(!st){ allComplete=false; return; } const tk=State.tasks.filter(t=>t.stageId===st.id); if(!tk.length){ allComplete=false; return; }
+  acs.forEach(a=>{ const st=State.stages.find(s=>s.aircraftId===a.id&&s.name===stName); if(!st){ return; } const tk=State.tasks.filter(t=>t.stageId===st.id); if(!tk.length){ return; }
     const tw=sum(tk,_flowW); const p= tw? sum(tk,t=>_flowW(t)*(t.percentComplete||0))/tw:0; pctSum+=p; cnt++;
     if(p>0&&p<100) anyAct=true; if(p<100) allComplete=false; if(tk.some(t=>t.status==="WORKING")) anyAct=true; });
-  const pct= cnt? round(pctSum/cnt,0):0; return { pct, status:(cnt&&allComplete)?"complete":((pct>0||anyAct)?"active":"pending") }; }
-function programFlow(programId){ const acs=State.aircraft.filter(a=>a.programId===programId); if(!acs.length) return [];
+  const pct= cnt? round(pctSum/cnt,0):0; const complete = cnt && (allComplete || pct>=100); return { pct, status: complete?"complete":((pct>0||anyAct)?"active":"pending") }; }
+function programFlow(programId, acsArg){ const acs=acsArg||State.aircraft.filter(a=>a.programId===programId); if(!acs.length) return [];
   const ref=State.stages.filter(s=>s.aircraftId===buildOrder(acs)[0].id).sort((a,b)=>a.sequence-b.sequence).map(s=>s.name);
   return ref.map(name=>{ let pctSum=0,cnt=0,anyAct=false,allComplete=true;
-    acs.forEach(a=>{ const st=State.stages.find(s=>s.aircraftId===a.id&&s.name===name); if(!st) return; const tk=State.tasks.filter(t=>t.stageId===st.id); if(!tk.length){ allComplete=false; return; }
+    acs.forEach(a=>{ const st=State.stages.find(s=>s.aircraftId===a.id&&s.name===name); if(!st) return; const tk=State.tasks.filter(t=>t.stageId===st.id); if(!tk.length){ return; }
       const tw=sum(tk,_flowW); const p= tw? sum(tk,t=>_flowW(t)*(t.percentComplete||0))/tw:0; pctSum+=p; cnt++;
       if(p>0&&p<100) anyAct=true; if(p<100) allComplete=false; if(tk.some(t=>t.status==="WORKING")) anyAct=true; });
-    const pct= cnt? round(pctSum/cnt,0):0; const status= (cnt&&allComplete)?"complete":((pct>0||anyAct)?"active":"pending");
+    const pct= cnt? round(pctSum/cnt,0):0; const status= (cnt&&(allComplete||pct>=100))?"complete":((pct>0||anyAct)?"active":"pending");
     return {name, pct, status}; }); }
 
 function viewLine(){
@@ -2497,18 +2619,18 @@ function viewLine(){
         <td class="num">${s.released?"\u2014":s.stationPct+"%"}</td>
         <td class="num"><b>${s.overall}%</b></td>
         <td><span class="chip ${stCls}">${stLabel}</span></td>
-        <td>${s.finMs?fmtDate(s.finMs):"\u2014"}${(a.plannedFinishMs&&s.finMs&&s.finMs>a.plannedFinishMs+DAY)?' <span style="color:var(--red)">\u25B2</span>':''}</td>
+        <td>${s.finMs?fmtDate(s.finMs):"\u2014"}${(a.plannedFinishMs&&s.finMs)?(s.finMs>a.plannedFinishMs+DAY?` <span style="color:var(--red);font-weight:600">+${Math.round((s.finMs-a.plannedFinishMs)/DAY)}d late</span>`:(s.finMs<a.plannedFinishMs-DAY?` <span style="color:var(--green)">${Math.round((a.plannedFinishMs-s.finMs)/DAY)}d early</span>`:` <span class="muted">on plan</span>`)):""}</td>
         <td style="white-space:nowrap"><button class="icobtn" data-act="line-build-up" data-id="${a.id}" title="Build earlier">\u25B2</button><button class="icobtn" data-act="line-build-down" data-id="${a.id}" title="Build later">\u25BC</button></td></tr>`; }).join("")
   }</tbody></table></div></div></div>`;
 
   const behindNames={}; stats.forEach(st=>{ if(st.behind && !st.released) behindNames[st.currentStation]=true; });
-  const dashRows=refStages.map((nm,i)=>{ const fl=stationFlowFleet(ap.id,nm);
+  const dashRows=refStages.map((nm,i)=>{ const fl=stationFlowFleet(ap.id,nm); const mh=stationManHoursFleet(ap.id,nm);
     let label,cls; if(fl.status==="complete"){ label="Completed"; cls="ok"; }
     else if(behindNames[nm]){ label="Delayed"; cls="err"; }
     else if(fl.status==="active"){ label="In Progress"; cls="info"; }
     else { label="Not Started"; cls=""; }
     const col= fl.pct>=100?"var(--green)":fl.pct>=50?"var(--accent)":fl.pct>0?"var(--amber)":"var(--line-2)";
-    return `<div class="pdash-row"><div class="pdash-name" title="${esc(nm)}">${i+1}. ${esc(nm)}</div><div class="pdash-bar"><div class="pdash-fill" style="width:${fl.pct}%;background:${col}"></div></div><div class="pdash-pct" style="color:${col}">${fl.pct}%</div><div class="pdash-chip"><span class="chip ${cls}">${label}</span></div></div>`; }).join("");
+    return `<div class="pdash-row"><div class="pdash-name" title="${esc(nm)}">${i+1}. ${esc(nm)}${mh>0?` <span class="muted" style="font-size:10.5px">\u00b7 ${mh} man-h</span>`:""}</div><div class="pdash-bar"><div class="pdash-fill" style="width:${fl.pct}%;background:${col}"></div></div><div class="pdash-pct" style="color:${col}">${fl.pct}%</div><div class="pdash-chip"><span class="chip ${cls}">${label}</span></div></div>`; }).join("");
   const dash=`<div class="panel" style="margin-bottom:14px"><div class="panel-h"><span class="eyebrow">Station dashboard</span><h3>Production stations</h3><span class="spacer"></span><span class="muted" style="font-size:11px">${refStages.length} stations</span></div>
     <div class="panel-b">
       <div class="pdash-row" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--line)"><div class="pdash-name" style="font-weight:700;color:var(--ink)">Overall fleet progress</div><div class="pdash-bar" style="height:15px"><div class="pdash-fill" style="width:${avg}%;background:var(--accent)"></div></div><div class="pdash-pct" style="font-size:14px">${avg}%</div><div class="pdash-chip"></div></div>
@@ -2572,7 +2694,8 @@ function viewReports(){
                ["resource","Resource Utilization","Labor & equipment loading and headroom"],
                ["capacity","Capacity Report","Peak loading, overloads, recommendations"],
                ["aircraft","Aircraft Status","Per-tail completion, stage, gate status"],
-               ["efficiency","Efficiency & Learning Curve","Required vs achieved efficiency, serial-build learning curve"]
+               ["efficiency","Efficiency & Learning Curve","Required vs achieved efficiency, serial-build learning curve"],
+               ["progress","Progress & Actuals","Per stage/task: planned vs actual hours, crew that worked, % done, schedule variance"]
               ].map(([k,t,d])=>`<button class="btn" style="justify-content:flex-start;text-align:left;padding:10px 12px" data-act="export-pdf" data-kind="${k}">
                 ${icon("pdf","ico")}<span><b>${t}</b><br><span class="muted" style="font-weight:400;font-size:11px">${d}</span></span></button>`).join("")}
             <button class="btn" style="justify-content:flex-start;text-align:left;padding:10px 12px" data-act="fleet-report">
@@ -2653,6 +2776,19 @@ const DOW_LABELS=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 function settingsCalendar(){ const ap=activeProgram(); return WorkCal.get(ap?activeCalendarId(ap.id):(State.calendars[0]&&State.calendars[0].id)); }
 function helpNote(html){ return `<div class="helpnote">${icon("info","ico")}<div>${html}</div></div>`; }
 
+function skillModal(key){ const sk=key?State.skills.find(s=>s.key===key):null;
+  openModal(sk?"Rename skill":"Add skill category", `
+    <div class="field"><label>Skill name</label><input id="skill_label" value="${sk?esc(sk.label):""}" placeholder="e.g. Bonding Technician"></div>
+    ${sk?`<div class="hint">Code <span class="mono">${esc(sk.key)}</span> stays the same, so existing pools and tasks keep working.</div>`:`<div class="hint">A short code is generated from the name. After adding, create a labour pool for this skill in Resources.</div>`}`,
+    `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="skill-save"${sk?` data-id="${esc(sk.key)}"`:""}>${icon("check","ico")} Save</button>`); }
+function skillSave(key){ const label=((document.getElementById("skill_label")||{}).value||"").trim(); if(!label){ toast("Enter a skill name","warn"); return; }
+  if(key){ const sk=State.skills.find(s=>s.key===key); if(sk) sk.label=label; audit("SKILL",key,"UPDATE","label",null,label); }
+  else { const k=skillKeyFrom(label); State.skills.push({key:k,label}); audit("SKILL",k,"CREATE",null,null,label); }
+  rebuildSkills(); closeModal(); commit(); toast("Skill saved"); }
+function skillRemove(key){ const sk=State.skills.find(s=>s.key===key); if(!sk) return;
+  if(skillInUse(key)){ toast("That skill is used by a pool or task \u2014 reassign those first","warn"); return; }
+  if(State.skills.length<=1){ toast("Keep at least one skill category","warn"); return; }
+  State.skills=State.skills.filter(s=>s.key!==key); audit("SKILL",key,"DELETE",null,sk.label,null); rebuildSkills(); commit(); toast("Skill removed"); }
 function viewSettings(){
   const s=State.settings;
   const dbState= Persist.available? '<span class="chip s-green"><span class="dot"></span>IndexedDB active</span>' : '<span class="chip s-amber"><span class="dot"></span>In-memory (export JSON to persist)</span>';
@@ -2708,6 +2844,15 @@ function viewSettings(){
         </div></div>
     </div>
 
+    <div class="panel"><div class="panel-h"><span class="eyebrow">Labour</span><h3>Skill categories</h3><span class="spacer"></span><button class="btn sm" data-act="skill-add">${icon("plus","ico")} Add skill</button></div>
+      <div class="panel-b">
+        ${helpNote("These are the trades your technicians belong to. Rename them to match your shop or add new ones. Every labour pool and task is tied to a skill here.")}
+        <table class="tbl"><thead><tr><th>Skill</th><th>Code</th><th class="num">Pools</th><th class="num">Tasks</th><th></th></tr></thead><tbody>
+        ${State.skills.map(sk=>{ const pools=State.laborPools.filter(p=>p.category===sk.key).length, tasks=State.tasks.filter(t=>t.laborSkill===sk.key).length;
+          return `<tr><td>${esc(sk.label)}</td><td class="mono" style="font-size:11px;color:var(--ink-3)">${esc(sk.key)}</td><td class="num">${pools}</td><td class="num">${tasks}</td>
+          <td style="white-space:nowrap;text-align:right"><button class="btn sm" data-act="skill-edit" data-id="${esc(sk.key)}">${icon("edit","ico")}</button> <button class="btn sm" data-act="skill-remove" data-id="${esc(sk.key)}"${(pools||tasks)?' title="In use \u2014 reassign first"':''}>${icon("trash","ico")}</button></td></tr>`; }).join("")}
+        </tbody></table>
+      </div></div>
     <div class="panel"><div class="panel-h"><span class="eyebrow">Working Calendar</span><h3>${esc(cal.name||"Calendar")}</h3>
       <span class="spacer"></span>
       <span class="muted mono" style="font-size:11px">${wh}h/day &middot; ${wdays} days/wk${overlap>0?` &middot; ${overlap}h overlap`:""}</span></div>
@@ -2811,9 +2956,9 @@ function programModal(id){
     </div>
     <div class="field"><label>Program name</label><input id="m_name" value="${esc(p?p.name:"")}" placeholder="Tactical UAV"></div>
     <div class="grid cols-2"><div class="field"><label>Line gating</label>
-      <select id="m_linemode"><option value="off" ${(p&&p.lineMode==="off")||!p||!p.lineMode?"selected":""}>Off (parallel)</option>
-        <option value="serial" ${p&&p.lineMode==="serial"?"selected":""}>Serial (SN1 then SN2)</option>
-        <option value="pulse" ${p&&p.lineMode==="pulse"?"selected":""}>Pulse line (relay)</option></select></div>
+      <select id="m_linemode"><option value="off" ${(p&&p.lineMode==="off")||!p||!p.lineMode?"selected":""}>Parallel \u2014 each tail on its own schedule</option>
+        <option value="serial" ${p&&p.lineMode==="serial"?"selected":""}>Serial \u2014 finish one tail before the next starts</option>
+        <option value="pulse" ${p&&p.lineMode==="pulse"?"selected":""}>Pulse line \u2014 a tail enters a station as the one ahead leaves it</option></select></div>
       <div class="field"><label>Line scope</label>
       <select id="m_linescope"><option value="program" ${!p||p.lineScope!=="model"?"selected":""}>Whole program</option>
         <option value="model" ${p&&p.lineScope==="model"?"selected":""}>Per model</option></select></div></div>
@@ -3374,8 +3519,8 @@ function exportCSV(kind){
   const ap=activeProgram(); const rows=[];
   if(kind==="efficiency"){
     const ef=Analytics.efficiency(ap?ap.id:null);
-    rows.push(["Unit","Serial","Model","Tasks","StdHrs","ActualHrs","EarnedHrs","PctComplete","WindowHrs","AvgCrew","RequiredEffPct","AchievedEffPct","Status"]);
-    ef.units.forEach(u=>rows.push([u.unit,u.serial,u.model,u.taskCount,u.std,u.act,u.earned,u.pct,u.winHrs,u.avgCrew,(u.requiredEff==null?"":u.requiredEff),(u.achievedEff==null?"":u.achievedEff),(u.complete?"Complete":(u.act>0?"In build":"Not started"))]));
+    rows.push(["Unit","Serial","Model","Tasks","StdHrs","ActualHrs","EarnedHrs","PctComplete","WindowHrs","AvgCrew","RequiredEffPct","AchievedEffPct","SchedFinish","PlannedFinish","OnPlan","OverrunDays","Status"]);
+    ef.units.forEach(u=>rows.push([u.unit,u.serial,u.model,u.taskCount,u.std,u.act,u.earned,u.pct,u.winHrs,u.avgCrew,(u.requiredEff==null?"":u.requiredEff),(u.achievedEff==null?"":u.achievedEff),(u.schedFinishMs?fmtDate(u.schedFinishMs):""),(u.plannedFinishMs?fmtDate(u.plannedFinishMs):""),(u.onPlan==null?"":(u.onPlan?"Yes":"No")),(u.overrunDays==null?"":u.overrunDays),(u.complete?"Complete":(u.act>0?"In build":"Not started"))]));
   } else if(kind==="resources"){
     rows.push(["Type","Category","Name","Count","Cost/Hr","Peak %"]);
     const u=ap?Analytics.utilizationSummary(ap.id):{labor:{},equip:{}};
@@ -3383,12 +3528,13 @@ function exportCSV(kind){
     State.equipment.forEach(e=>rows.push(["EQUIPMENT",e.type,e.name,e.units,e.costRatePerHr, u.equip[e.type]?round(u.equip[e.type].peak,0):0]));
   } else {
     const sched=ap?State.schedules[ap.id]:null; const map={}; if(sched) sched.taskSchedules.forEach(s=>map[s.taskId]=s);
-    rows.push(["WBS","Task","Stage","Aircraft","Skill","PlannedHrs","Assigned","CureHrs","CoolHrs","Priority","Status","%Complete","PlannedCost","Start","Finish","Critical"]);
+    rows.push(["WBS","Task","Stage","Aircraft","Skill","PlannedHrs","ActualHrs","VarianceHrs","Assigned","ActualWorkers","CureHrs","CoolHrs","Priority","Status","%Complete","PlannedCost","ActualCost","Start","Finish","Critical"]);
     State.tasks.filter(t=>!ap||t.programId===ap.id).forEach(t=>{
       const st=byId(State.stages,t.stageId); const ac=st?byId(State.aircraft,st.aircraftId):null; const s=map[t.id];
       rows.push([t.wbsCode,t.name,st?st.name:"",ac?ac.serialNumber:"",SKILL_LABEL[t.laborSkill]||t.laborSkill,
-        t.plannedLaborHours,t.assignedWorkers,t.curingDurationHrs,t.coolingDurationHrs,t.priority,t.status,
-        t.percentComplete,t.plannedCost, s?new Date(s.startMs).toISOString():"", s?new Date(s.finishMs).toISOString():"",
+        t.plannedLaborHours,(t.actualLaborHours||0),round((t.actualLaborHours||0)-(t.plannedLaborHours||0),1),
+        t.assignedWorkers,(taskActualWorkers(t)||""),t.curingDurationHrs,t.coolingDurationHrs,t.priority,t.status,
+        t.percentComplete,t.plannedCost,(t.actualCost||0), s?new Date(s.startMs).toISOString():"", s?new Date(s.finishMs).toISOString():"",
         s&&s.onCriticalPath?"YES":""]);
     });
   }
@@ -3397,6 +3543,7 @@ function exportCSV(kind){
 }
 
 /* ---------- PDF (jsPDF) ---------- */
+function prettyStatus(s){ if(!s) return "\u2014"; return String(s).replace(/_/g," ").toLowerCase().replace(/^./,c=>c.toUpperCase()); }
 function pdfDoc(){ const J=window.jspdf&&window.jspdf.jsPDF; if(!J) return null; return new J({unit:"pt",format:"a4"}); }
 /* ---------- EFFICIENCY & LEARNING CURVE ---------- */
 function viewEfficiency(){
@@ -3411,7 +3558,7 @@ function viewEfficiency(){
       <div class="val" style="display:flex;align-items:center;gap:6px"><input type="number" min="10" max="200" step="5" value="${expEff}" data-act="set-expected-eff" style="width:62px;background:var(--panel-2);border:1px solid var(--line-2);color:var(--ink);border-radius:6px;padding:2px 6px;font-size:24px;font-weight:700;font-family:var(--font-display)">%</div>
       <div class="meta">planning pace \u2014 drives the schedule</div></div>
     <div class="kpi ${acCls}"><div class="label">Achieved Efficiency</div><div class="val">${ac==null?"\u2014":ac+"<span class='unit'>%</span>"}</div><div class="meta">earned \u00f7 actual labor</div></div>
-    <div class="kpi k-blue"><div class="label">Required Efficiency</div><div class="val">${ra==null?"\u2014":ra+"<span class='unit'>%</span>"}</div><div class="meta">to hold planned windows</div></div>
+    <div class="kpi k-blue"><div class="label">Required Efficiency</div><div class="val">${ra==null?"\u2014":ra+"<span class='unit'>%</span>"}</div><div class="meta">pace to fit the scheduled build into your planned window (&gt;100% = window too short)</div></div>
     <div class="kpi"><div class="label">Learning Rate</div><div class="val">${lc.enough?lc.LR+"<span class='unit'>%</span>":"\u2014"}</div><div class="meta">${lc.enough?lc.slopePct+"% \u2193 per doubling":"need 2+ built units"}</div></div>
     <div class="kpi"><div class="label">Units With Actuals</div><div class="val">${eff.built}<span class="unit">/${units.length}</span></div><div class="meta">serial builds recorded</div></div>
   </div>`;
@@ -3419,21 +3566,26 @@ function viewEfficiency(){
     const req=u.requiredEff==null?"\u2014":u.requiredEff+"%"; const ach=u.achievedEff==null?"\u2014":u.achievedEff+"%";
     const achCol= u.achievedEff==null?"var(--ink-3)":(u.requiredEff!=null&&u.achievedEff<u.requiredEff?"var(--red)":u.achievedEff>=100?"var(--green)":"var(--amber)");
     const status= u.complete? '<span class="chip s-green"><span class="dot"></span>Complete</span>' : u.act>0? '<span class="chip s-blue"><span class="dot"></span>In build</span>' : '<span class="chip"><span class="dot"></span>Not started</span>';
+    const onplan= u.onPlan==null? '<span class="muted">\u2014</span>'
+      : u.onPlan? `<span class="chip s-green"><span class="dot"></span>On plan${u.overrunDays<0?" ("+(-u.overrunDays)+"d early)":""}</span>`
+      : `<span class="chip s-red"><span class="dot"></span>Late ${u.overrunDays}d</span>`;
     return `<tr data-act="open-aircraft-stages" data-id="${u.id}" style="cursor:pointer">
       <td class="mono">U${u.unit}</td><td><b>${esc(u.serial)}</b></td>
       <td class="num">${u.std}</td><td class="num">${u.act||"\u2014"}</td><td class="num">${u.earned}</td><td class="num">${u.pct}%</td>
-      <td class="num">${req}</td><td class="num" style="color:${achCol};font-weight:700">${ach}</td><td>${status}</td></tr>`;
-  }).join("") : `<tr><td colspan="9" class="muted">No aircraft yet \u2014 add tails to this program.</td></tr>`;
+      <td class="num">${req}</td><td class="num" style="color:${achCol};font-weight:700">${ach}</td><td>${onplan}</td><td>${status}</td></tr>`;
+  }).join("") : `<tr><td colspan="10" class="muted">No aircraft yet \u2014 add tails to this program.</td></tr>`;
   let analysis;
   if(lc.enough){
     const trend= lc.LR<90? "a strong learning effect" : lc.LR<98? "a moderate learning effect" : "little measurable learning yet";
     const behind= (ac!=null&&ra!=null&&ac<ra);
+    const _onp=units.filter(u=>u.onPlan===true).length, _late=units.filter(u=>u.onPlan===false).length, _have=units.filter(u=>u.onPlan!=null).length;
+    const planLine= _have? ` <b>${_onp} of ${_have}</b> scheduled tail(s) finish on or before their planned date${_late?`; <b style="color:var(--red)">${_late} late</b> \u2014 add crew, switch to a pulse line, or widen the planned windows.`:"."}` : "";
     analysis= `Across ${lc.points.length} built unit(s), first-unit labor fits at <b>~${lc.T1} h</b> with ${trend} \u2014 a <b>${lc.LR}% learning rate</b> (each doubling of cumulative units cuts unit hours by ~${lc.slopePct}%), R\u00b2 ${lc.r2}. `+
       (lc.proj.length? `The next unit (U${lc.obsMax+1}) is projected at <b>~${lc.proj[0].hrs} h</b>. `:"")+
       `Fleet achieved efficiency is ${ac==null?"n/a":"<b>"+ac+"%</b>"} versus a planned ${expEff}% and a required ${ra==null?"n/a":ra+"%"}`+
-      (behind? ` \u2014 currently <b style="color:var(--red)">behind</b> the rate needed; add crew, overtime, or widen the planned window.`:` \u2014 on or ahead of the rate needed to hold the planned windows.`);
+      (behind? ` \u2014 currently <b style="color:var(--red)">behind</b> the rate needed; add crew, overtime, or widen the planned window.`:` \u2014 on or ahead of the rate needed to hold the planned windows.`)+planLine;
   } else {
-    analysis= `Record <b>Actual labor (hrs)</b> and <b>% complete</b> on each task (in the task editor) for at least two serially-built tails to fit a learning curve. <b>Achieved efficiency</b> = earned \u00f7 actual labor; <b>required efficiency</b> = standard hours \u00f7 the labor capacity available inside each aircraft\u2019s planned window.`;
+    analysis= `Record <b>Actual labor (hrs)</b> and <b>% complete</b> on each task (in the task editor) for at least two serially-built tails to fit a learning curve. <b>Achieved efficiency</b> = earned \u00f7 actual labor; <b>required efficiency</b> = expected pace \u00d7 scheduled span \u00f7 planned window (it responds to sequence, gating, parallel stages and line mode).`+ (function(){ const _onp=units.filter(u=>u.onPlan===true).length, _late=units.filter(u=>u.onPlan===false).length, _have=units.filter(u=>u.onPlan!=null).length; return _have? ` <b>${_onp} of ${_have}</b> scheduled tail(s) meet their planned date${_late?`; <b style="color:var(--red)">${_late} late</b>.`:"."}`:""; })();
   }
   return viewHead("Efficiency & Learning Curve", esc(ap.name)+" \u00b7 productivity & serial-build analysis",
     `<button class="btn sm" data-act="export-csv" data-kind="efficiency">${icon("download","ico")} Units CSV</button>
@@ -3455,9 +3607,11 @@ function viewEfficiency(){
     <div class="panel" style="margin-top:12px"><div class="panel-h"><span class="eyebrow">${units.length} tail(s)</span><h3>Per-unit efficiency</h3>
       <span class="spacer"></span><span class="muted" style="font-size:11px">Click a row to open the aircraft</span></div>
       <div class="panel-b"><div class="tbl-wrap"><table class="tbl"><thead><tr>
-        <th>Unit</th><th>Serial</th><th class="num">Std h</th><th class="num">Actual h</th><th class="num">Earned h</th><th class="num">%</th><th class="num">Required</th><th class="num">Achieved</th><th>Status</th>
+        <th>Unit</th><th>Serial</th><th class="num">Std h</th><th class="num">Actual h</th><th class="num">Earned h</th><th class="num">%</th><th class="num">Required</th><th class="num">Achieved</th><th>On plan?</th><th>Status</th>
       </tr></thead><tbody>${rowsHtml}</tbody></table></div></div></div>`;
 }
+postRender.dashboard=function(){ const ap=activeProgram(); if(!ap) return; const lc=Analytics.learningCurve(ap.id);
+  if(lc.enough){ const cv=document.getElementById("dash-lc"); if(cv) Chart.learningCurve(cv, lc.points, lc.curve, {obsMax:lc.obsMax, height:220}); } };
 postRender.efficiency=function(){ const ap=activeProgram(); if(!ap) return; const lc=Analytics.learningCurve(ap.id);
   if(lc.enough){ const cv=document.getElementById("lc-canvas"); if(cv) Chart.learningCurve(cv, lc.points, lc.curve, {obsMax:lc.obsMax, height:260}); } };
 
@@ -3471,25 +3625,31 @@ function fleetReportModal(){
       <select id="fr_scope">
         <option value="program">This program${ap?" \u2014 "+esc(ap.name):""}</option>
         <option value="all">All programs (whole fleet)</option>
+        <option value="aircraft">One aircraft (pick the tail below)</option>
       </select></div>
+    <div class="field"><label>Aircraft (for \u201cOne aircraft\u201d)</label>
+      <select id="fr_aircraft"><option value="">\u2014 all tails in scope \u2014</option>${State.aircraft.slice().sort((x,z)=>String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true})).map(a=>{const pr=byId(State.programs,a.programId);return `<option value="${a.id}">${esc(a.serialNumber)}${pr?" \u2014 "+esc(pr.name):""}</option>`;}).join("")}</select></div>
     <div class="field"><label>Model filter</label>
       <select id="fr_model"><option value="">All models</option>${models.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></div>
-    <div class="hint">Generates a professional PDF: fleet summary, per-program roll-up, and a per-aircraft status table (current station, % complete, schedule variance, RAG health). Choose \u201cAll programs\u201d for an executive fleet view, or filter to one model.</div>`,
+    <div class="hint">Builds a clear PDF: fleet summary, per-program roll-up, station and aircraft progress bars, an aircraft\u00d7station map, and a status table (current station, % complete, schedule variance). Pick \u201cAll programs\u201d for the whole fleet, one model, or a single tail.</div>`,
     `<button class="btn" data-act="m-close">Cancel</button>
      <button class="btn" data-act="fleet-report-csv">${icon("download","ico")} CSV</button>
      <button class="btn primary" data-act="fleet-report-go">${icon("report","ico")} Generate PDF</button>`);
 }
-function fleetScopeAircraft(scope, model){
+function fleetScopeAircraft(scope, model, acId){
   let acs;
+  if(scope==="aircraft"){ const a=byId(State.aircraft,acId); return a?[a]:[]; }
   if(scope==="all") acs=State.aircraft.slice();
   else { const ap=activeProgram(); acs=ap? State.aircraft.filter(a=>a.programId===ap.id):[]; }
   if(model) acs=acs.filter(a=>a.model===model);
   return acs;
 }
 function fleetReportCSV(){
-  const scope=(document.getElementById("fr_scope")||{}).value||"program";
+  let scope=(document.getElementById("fr_scope")||{}).value||"program";
   const model=(document.getElementById("fr_model")||{}).value||"";
-  const acs=fleetScopeAircraft(scope,model); closeModal();
+  const acId=(document.getElementById("fr_aircraft")||{}).value||"";
+  if(acId) scope="aircraft"; else if(scope==="aircraft") scope="program";
+  const acs=fleetScopeAircraft(scope,model,acId); closeModal();
   if(!acs.length){ toast("No aircraft in scope","warn"); return; }
   const rows=[["Program","Serial","Model","BuildRev","CurrentStation","StationPct","OverallPct","Status","PlannedFinish","ForecastFinish","VarianceDays"]];
   acs.forEach(a=>{ const st=acStatus(a.id); const prog=byId(State.programs,a.programId);
@@ -3501,11 +3661,13 @@ function fleetReportCSV(){
   triggerDownload("fleet-status-"+isoStamp()+".csv", csv, "text/csv;charset=utf-8"); toast("Fleet status CSV exported");
 }
 function exportFleetPDF(){
-  const scope=(document.getElementById("fr_scope")||{}).value||"program";
+  let scope=(document.getElementById("fr_scope")||{}).value||"program";
   const model=(document.getElementById("fr_model")||{}).value||"";
+  const acId=(document.getElementById("fr_aircraft")||{}).value||"";
+  if(acId) scope="aircraft"; else if(scope==="aircraft") scope="program";
   closeModal();
   const doc=pdfDoc(); if(!doc){ toast("PDF engine offline \u2014 use Print \u2192 Save as PDF","warn"); return; }
-  const acs=fleetScopeAircraft(scope,model);
+  const acs=fleetScopeAircraft(scope,model,acId);
   if(!acs.length){ toast("No aircraft in scope","warn"); return; }
   const M=44, W=doc.internal.pageSize.getWidth(), H=doc.internal.pageSize.getHeight(), CW=W-2*M; let y=0;
   const C={ink:[28,38,52],sub:[110,125,140],line:[223,229,236],green:[22,140,70],amber:[193,130,10],red:[206,42,42],blue:[37,99,235],head:[233,239,245],zebra:[247,249,251]};
@@ -3569,7 +3731,7 @@ function exportFleetPDF(){
     ensure(16); doc.text("SPI "+(e.SPI!=null?e.SPI.toFixed(2):"\u2014")+"      CPI "+(e.CPI!=null?e.CPI.toFixed(2):"\u2014")+"      Earned value "+Math.round(e.pctComplete||0)+"%      Line gating: "+((prog&&prog.lineMode)||"off"), M, y); y+=20;
 
     const behindNames={}; list.forEach(a=>{ const st=acStatus(a.id); if(st.behind && !st.released) behindNames[st.currentStation]=true; });
-    const flow=programFlow(pid);
+    const flow=programFlow(pid, list);
 
     subhead("Station progress");
     flow.forEach(stn=>{ ensure(17);
@@ -3579,10 +3741,12 @@ function exportFleetPDF(){
       else if(stn.status==="active"){ status="In Progress"; scol=BLUE; }
       else { status="Not Started"; scol=C.sub; }
       doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink);
-      let nm=stn.name; while(doc.getTextWidth(nm)>nameW-8 && nm.length>4) nm=nm.slice(0,-2); doc.text(nm, M, y+3);
-      pbar(barX0, y-4, barW, 9, stn.pct, pcol(stn.pct));
-      doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor.apply(doc,pcol(stn.pct)); doc.text(stn.pct+"%", pctX, y+3, {align:"right"});
-      chip(chipX, y, status, scol); y+=16; });
+      let nm=stn.name; while(doc.getTextWidth(nm)>nameW-8 && nm.length>4) nm=nm.slice(0,-2); doc.text(nm, M, y+1);
+      const _smh=stationManHoursFleet(pid,stn.name,list); if(_smh>0){ doc.setFont("helvetica","normal"); doc.setFontSize(6.6); doc.setTextColor.apply(doc,C.sub); doc.text(_smh+" man-h", M, y+9); }
+      pbar(barX0, y-2, barW, 9, stn.pct, pcol(stn.pct));
+      doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor.apply(doc,pcol(stn.pct)); doc.text(stn.pct+"%", pctX, y+2, {align:"right"});
+      doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor.apply(doc,pcol(stn.pct)); 
+      chip(chipX, y, status, scol); y+=18; });
     y+=6;
 
     subhead("Aircraft progress");
@@ -3590,7 +3754,7 @@ function exportFleetPDF(){
       const status= st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started"));
       const scol= st.released?C.green:(st.behind?C.red:(st.started?BLUE:C.sub));
       doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink); doc.text(a.serialNumber, M, y+2);
-      doc.setFont("helvetica","normal"); doc.setFontSize(6.8); doc.setTextColor.apply(doc,C.sub); doc.text(st.released?"\u2691 released":(st.currentStation||""), M, y+11);
+      doc.setFont("helvetica","normal"); doc.setFontSize(6.8); doc.setTextColor.apply(doc,C.sub); doc.text(st.released?"released":(st.currentStation||""), M, y+11);
       pbar(barX0, y-4, barW, 9, st.overall, pcol(st.overall));
       doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor.apply(doc,pcol(st.overall)); doc.text(st.overall+"%", pctX, y+3, {align:"right"});
       chip(chipX, y, status, scol); y+=19; });
@@ -3631,7 +3795,7 @@ function exportPDF(kind){
   const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
   const M=44; let y=0;
   const W=doc.internal.pageSize.getWidth(), H=doc.internal.pageSize.getHeight(), CW=W-2*M;
-  const titleMap={executive:"Executive Summary",weekly:"Weekly Production Report",resource:"Resource Utilization Report",capacity:"Capacity Planning Report",aircraft:"Aircraft Status Report",efficiency:"Efficiency & Learning Curve Report"};
+  const titleMap={executive:"Executive Summary",weekly:"Weekly Production Report",resource:"Resource Utilization Report",capacity:"Capacity Planning Report",aircraft:"Aircraft Status Report",efficiency:"Efficiency & Learning Curve Report",progress:"Progress & Actuals Report"};
   const C={ink:[28,38,52],sub:[110,125,140],line:[223,229,236],green:[22,140,70],amber:[193,130,10],red:[206,42,42],blue:[37,99,235],grey:[120,130,140],head:[233,239,245],zebra:[247,249,251]};
   const spiCol=v=> v<0.9?C.red : v<0.99?C.amber : C.green;
   const pctCol=v=> v>100?C.red : v>=85?C.amber : v>=60?C.green : C.blue;
@@ -3673,10 +3837,14 @@ function exportPDF(kind){
       if(c.sub){ doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub); doc.text(String(c.sub),x+10,y+48); } });
     y+=64; }
   function table(cols,widths,data,opt){
-    opt=opt||{}; const align=opt.align||[]; const x0=M; ensure(28);
+    if(typeof opt==="function") opt={cell:opt};
+    opt=opt||{}; const x0=M; ensure(28);
+    // ">" prefix on a header = right-aligned column (convention used across reports)
+    const heads = cols.map(c=> (typeof c==="string" && c.charAt(0)===">")? c.slice(1) : c);
+    const align = opt.align || cols.map(c=> (typeof c==="string" && c.charAt(0)===">")? "r":"l");
     doc.setFillColor.apply(doc,(opt.headFill||C.head)); doc.rect(M,y-12,CW,20,"F");
     doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.setTextColor(64,78,94);
-    let x=x0; cols.forEach((c,i)=>{ const a=align[i]; doc.text(String(c), a==="r"?x+widths[i]-4:x+4, y+2, {align:a==="r"?"right":"left"}); x+=widths[i]; });
+    let x=x0; heads.forEach((c,i)=>{ const a=align[i]; doc.text(String(c), a==="r"?x+widths[i]-4:x+4, y+2, {align:a==="r"?"right":"left"}); x+=widths[i]; });
     y+=16; doc.setFont("helvetica","normal"); doc.setFontSize(8.5);
     if(!data.length){ ensure(15); doc.setTextColor.apply(doc,C.sub); doc.text("\u2014 none \u2014",M+4,y); y+=14; }
     data.forEach((row,ri)=>{ ensure(15);
@@ -3710,6 +3878,30 @@ function exportPDF(kind){
     doc.setFillColor.apply(doc,C.blue); doc.circle(M+72,y-3,2.4,"F"); doc.text("Active (in progress)",M+78,y);
     doc.setFillColor.apply(doc,C.grey); doc.circle(M+182,y-3,2.4,"F"); doc.text("Pending",M+188,y);
     y+=16; }
+  function schDate(ms){ if(ms==null) return "\u2014"; const d=new Date(ms);
+    return d.toLocaleDateString(undefined,{month:"short",day:"numeric"})+"  "+String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
+  function schHrs(min){ const h=(min||0)/60; return h>0? (Math.round(h*10)/10).toString():"\u2014"; }
+  function scheduleTable(acId){
+    const sts=State.stages.filter(s=>s.aircraftId===acId).sort((x,z)=>x.sequence-z.sequence);
+    let any=false;
+    sts.forEach(st=>{ const items=State.tasks.filter(t=>t.stageId===st.id).map(t=>({t,sc:map[t.id]})).filter(o=>o.sc)
+        .sort((a,b)=>a.sc.startMs-b.sc.startMs || String(a.t.wbsCode).localeCompare(String(b.t.wbsCode),undefined,{numeric:true}));
+      if(!items.length) return; any=true;
+      ensure(22); doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink);
+      doc.text(st.sequence+".  "+st.name+"      "+stageManHours(st.id)+" man-h", M, y); y+=11;
+      const rows=items.map(o=>{ const sc=o.sc,t=o.t;
+        return [ (sc.onCriticalPath?"\u2022 ":"")+(t.wbsCode||""), t.name, String(t.assignedWorkers||"\u2014"),
+          schDate(sc.startMs), schDate(sc.finishMs), schHrs(sc.workMin), schHrs(sc.cureMin), schHrs(sc.coolMin),
+          t.status==="COMPLETE"?"Done":((t.percentComplete||0)>0?(t.percentComplete+"%"):"Planned") ]; });
+      table(["WBS","Task",">Crew","Start","Finish",">Work h",">Cure h",">Cool h","Status"],
+        [42,131,32,64,64,38,38,38,52], rows,
+        { align:["l","l","r","l","l","r","r","r","l"],
+          cell:(ri,ci,cell)=>{ if(ci===0 && /\u2022/.test(cell)) return C.red;
+            if(ci===8) return cell==="Done"?C.green:(cell==="Planned"?C.sub:C.blue); return null; } });
+    });
+    if(!any){ ensure(14); doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor.apply(doc,C.sub); doc.text("No scheduled tasks \u2014 run the scheduler to populate dates.",M,y); y+=14; }
+    else { ensure(12); doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub);
+      doc.text("\u2022 on the critical path   \u00b7   Work = hands-on hours   \u00b7   Cure / Cool = oven & rack time (labour released)", M, y); y+=14; } }
 
   const e=Analytics.evm(ap.id)||{BAC:0,EV:0,AC:0,PV:0,SV:0,CV:0,SPI:1,CPI:1,EAC:0,ETC:0,pctComplete:0};
   const fc=Analytics.forecast(ap.id); const u=Analytics.utilizationSummary(ap.id);
@@ -3727,8 +3919,8 @@ function exportPDF(kind){
   if(kind==="executive"){
     metricBand([
       {label:"Complete",value:e.pctComplete+"%",sub:allTasks.filter(t=>t.status==="COMPLETE").length+" / "+allTasks.length+" tasks",color:pctCol(e.pctComplete>100?100:e.pctComplete)},
-      {label:"Schedule SPI",value:e.SPI,sub:e.SPI<1?"behind plan":"on / ahead",color:spiCol(e.SPI)},
-      {label:"Cost CPI",value:e.CPI,sub:e.CPI<1?"over budget":"on / under",color:spiCol(e.CPI)},
+      {label:"Schedule SPI",value:(e.SPI!=null?e.SPI.toFixed(2):"\u2014"),sub:e.SPI<1?"behind plan":"on / ahead",color:spiCol(e.SPI)},
+      {label:"Cost CPI",value:(e.CPI!=null?e.CPI.toFixed(2):"\u2014"),sub:e.CPI<1?"over budget":"on / under",color:spiCol(e.CPI)},
       {label:"Forecast",value:fc?fc.risk.toUpperCase():"\u2014",sub:fc?fc.confidence+"% confidence":"",color:fc?(fc.risk==="High"?C.red:fc.risk==="Medium"?C.amber:C.green):C.grey}
     ]);
     section("Program Overview");
@@ -3760,7 +3952,7 @@ function exportPDF(kind){
     ],{align:["l","r"]});
     section("Fleet Snapshot");
     table(["Tail","Model","Current stage","Complete","Status"],[80,90,150,70,CW-390],
-      acs.map(a=>[a.serialNumber,a.model,currentStage(a.id),aircraftCompletion(a.id)+"%",a.status]),
+      acs.map(a=>[a.serialNumber,a.model,currentStage(a.id),aircraftCompletion(a.id)+"%",prettyStatus(a.status)]),
       {align:["l","l","l","r","l"],cell:(r,c,v)=> c===3? pctCol(parseFloat(v)) : null});
     section("Top Risks & Recommendations");
     const bn=Analytics.bottlenecks(ap.id);
@@ -3879,7 +4071,7 @@ function exportPDF(kind){
   } else if(kind==="aircraft"){
     section("Fleet Completion");
     table(["Tail","Model","Rev","Current stage","Complete","Status"],[80,80,45,CW-415,70,140],
-      acs.map(a=>[a.serialNumber,a.model,a.buildRevision,currentStage(a.id),aircraftCompletion(a.id)+"%",a.status]),
+      acs.map(a=>[a.serialNumber,a.model,a.buildRevision,currentStage(a.id),aircraftCompletion(a.id)+"%",prettyStatus(a.status)]),
       {align:["l","l","l","l","r","l"],cell:(r,c,v)=> c===4?pctCol(parseFloat(v)):null});
     acs.forEach(a=>{
       section("Aircraft "+a.serialNumber, a.model+" \u00b7 config "+a.configVersion+" \u00b7 rev "+a.buildRevision);
@@ -3889,10 +4081,12 @@ function exportPDF(kind){
       doc.setFont("helvetica","bold"); doc.setTextColor.apply(doc,pctCol(comp)); doc.text(comp+"%",W-M,y+6,{align:"right"}); y+=24;
       flowChart(stationFlow(a.id));
       const sts=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
-      table(["#","Stage","Tasks","Done","Stage %"],[34,CW-310,70,70,120],
+      table(["#","Stage","Tasks","Man-h","Done","Stage %"],[30,CW-372,58,70,58,90],
         sts.map(st=>{ const tk=State.tasks.filter(t=>t.stageId===st.id); const dn=tk.filter(t=>t.status==="COMPLETE").length;
-          const pct= tk.length? round(dn/tk.length*100,0):0; return [st.sequence,st.name,tk.length,dn,pct+"%"]; }),
-        {align:["r","l","r","r","r"],cell:(r,c,v)=> c===4?pctCol(parseFloat(v)):null});
+          const pct= tk.length? round(dn/tk.length*100,0):0; return [st.sequence,st.name,tk.length,stageManHours(st.id),dn,pct+"%"]; }),
+        {align:["r","l","r","r","r","r"],cell:(r,c,v)=> c===5?pctCol(parseFloat(v)):null});
+      section("Production Schedule","planned start to finish  \u00b7  durations  \u00b7  critical path");
+      scheduleTable(a.id);
       const gates=State.gates.filter(g=>g.aircraftId===a.id).sort((x,z)=>x.gateNumber-z.gateNumber);
       table(["Gate","Criterion","Status","Signed by","When"],[50,CW-356,80,110,116],
         gates.map(g=>["G"+g.gateNumber,g.name,g.status,g.approvedBy||"\u2014",g.approvedAtMs?fmtDate(g.approvedAtMs):"\u2014"]),
@@ -3902,17 +4096,21 @@ function exportPDF(kind){
     const lc=Analytics.learningCurve(ap.id); const ef=lc.eff; const acv=ef.progAchieved, rav=ef.progRequired;
     metricBand([
       {label:"Achieved Eff.",value: acv==null?"\u2014":acv+"%", sub:"earned \u00f7 actual", color: acv==null?C.grey:(rav!=null&&acv<rav?C.red:acv>=100?C.green:C.amber)},
-      {label:"Required Eff.",value: rav==null?"\u2014":rav+"%", sub:"to hold windows", color:C.blue},
+      {label:"Required Eff.",value: rav==null?"\u2014":rav+"%", sub:"fit build to window", color:C.blue},
       {label:"Learning Rate",value: lc.enough?lc.LR+"%":"\u2014", sub: lc.enough?lc.slopePct+"% per doubling":"need 2+ units", color:C.ink},
       {label:"Units (actuals)",value: ef.built+" / "+ef.units.length, sub:"serial builds", color:C.ink}
     ]);
     section("Per-Unit Efficiency","standard vs actual labor hours");
-    table(["Unit","Serial","Std h","Act h","Earned","%","Req %","Ach %","Status"],
-      [38, CW-376, 46,46,50,34,46,46,70],
-      ef.units.map(u=>["U"+u.unit,u.serial,u.std,(u.act||"\u2014"),u.earned,u.pct+"%",(u.requiredEff==null?"\u2014":u.requiredEff+"%"),(u.achievedEff==null?"\u2014":u.achievedEff+"%"),(u.complete?"Complete":(u.act>0?"In build":"Not started"))]),
-      {align:["l","l","r","r","r","r","r","r","l"], cell:(r,c)=>{ if(c!==7) return null; const u=ef.units[r]; if(!u||u.achievedEff==null) return C.grey; if(u.requiredEff!=null&&u.achievedEff<u.requiredEff) return C.red; return u.achievedEff>=100?C.green:C.amber; }});
+    table(["Unit","Serial","Std h","Act h","Earned","%","Req %","Ach %","On plan","Status"],
+      [38, CW-436, 46,46,50,34,46,46,60,70],
+      ef.units.map(u=>["U"+u.unit,u.serial,u.std,(u.act||"\u2014"),u.earned,u.pct+"%",(u.requiredEff==null?"\u2014":u.requiredEff+"%"),(u.achievedEff==null?"\u2014":u.achievedEff+"%"),
+        (u.onPlan==null?"\u2014":(u.onPlan?"On plan":("Late "+u.overrunDays+"d"))),
+        (u.complete?"Complete":(u.act>0?"In build":"Not started"))]),
+      {align:["l","l","r","r","r","r","r","r","l","l"], cell:(r,c)=>{ const u=ef.units[r]; if(!u) return null;
+        if(c===7){ if(u.achievedEff==null) return C.grey; if(u.requiredEff!=null&&u.achievedEff<u.requiredEff) return C.red; return u.achievedEff>=100?C.green:C.amber; }
+        if(c===8){ if(u.onPlan==null) return C.grey; return u.onPlan?C.green:C.red; } return null; }});
     if(lc.enough){
-      section("Learning Curve","Wright model \u00b7 LR "+lc.LR+"% \u00b7 R\u00b2 "+lc.r2);
+      section("Learning Curve","Wright model  \u00b7  LR "+lc.LR+"%  \u00b7  R2 "+lc.r2);
       ensure(196); const px=M, pw=CW, ph=172, py=y;
       const maxN=lc.obsMax+5; const maxV=Math.max.apply(null,[lc.T1].concat(lc.curve.map(c=>c.hrs)).concat(lc.points.map(p=>p.hrs)))*1.08;
       const plotL=px+46, plotR=px+pw-14, plotT=py+8, plotB=py+ph-20, plotW=plotR-plotL, plotH=plotB-plotT;
@@ -3934,6 +4132,53 @@ function exportPDF(kind){
       an="Across "+lc.points.length+" built unit(s), first-unit labor fits at ~"+lc.T1+" h with "+trend+" \u2014 a "+lc.LR+"% learning rate (each doubling of cumulative units cuts unit hours by ~"+lc.slopePct+"%), R\u00b2 "+lc.r2+". "+(lc.proj.length?"The next unit (U"+(lc.obsMax+1)+") is projected at ~"+lc.proj[0].hrs+" h. ":"")+"Fleet achieved efficiency is "+(acv==null?"n/a":acv+"%")+" against a required "+(rav==null?"n/a":rav+"%")+(behind?" \u2014 currently behind the rate needed to hold the planned windows; add crew, authorise overtime, or widen the window.":" \u2014 on or ahead of the rate needed to hold the planned windows.");
     } else an="Record actual labor hours and % complete on each task for at least two serially-built tails to fit a learning curve. Achieved efficiency = earned \u00f7 actual labor; required efficiency = standard hours \u00f7 the labor capacity available inside each aircraft's planned window.";
     paragraph(an);
+
+  } else if(kind==="progress"){
+    const acs2=State.aircraft.filter(a=>a.programId===ap.id).sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
+    const sc=State.schedules[ap.id]; const smap={}; if(sc) sc.taskSchedules.forEach(s=>smap[s.taskId]=s);
+    const e=Analytics.evm(ap.id)||{SPI:1,CPI:1};
+    const pTasks=State.tasks.filter(t=>t.programId===ap.id);
+    const planH=sum(pTasks,t=>t.plannedLaborHours||0), actH=sum(pTasks,t=>t.actualLaborHours||0);
+    metricBand([
+      {label:"Planned labour", value:Math.round(planH)+" h", sub:"standard hours", color:C.blue},
+      {label:"Actual labour", value:Math.round(actH)+" h", sub:"booked to date", color:C.ink},
+      {label:"Variance", value:(actH-planH>=0?"+":"")+Math.round(actH-planH)+" h", sub:(actH>planH?"over plan":"under / in progress"), color:(actH>planH?C.red:C.green)},
+      {label:"SPI / CPI", value:(e.SPI!=null?e.SPI.toFixed(2):"\u2014")+" / "+(e.CPI!=null?e.CPI.toFixed(2):"\u2014"), sub:"schedule / cost", color:(e.SPI<1?C.amber:C.green)}
+    ]);
+    if(!acs2.length){ paragraph("No aircraft in this program yet."); }
+    acs2.forEach(a=>{
+      const st=acStatus(a.id);
+      const aStages=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
+      const aTasks=[]; aStages.forEach(s=>State.tasks.filter(t=>t.stageId===s.id).forEach(t=>aTasks.push(t)));
+      const aPlan=sum(aTasks,t=>t.plannedLaborHours||0), aAct=sum(aTasks,t=>t.actualLaborHours||0);
+      const varD=(a.plannedFinishMs&&st.finMs)?Math.round((st.finMs-a.plannedFinishMs)/DAY):null;
+      section("Aircraft "+a.serialNumber+"  \u2014  "+aircraftCompletion(a.id)+"% complete",
+        "planned "+Math.round(aPlan)+" h  \u00b7  actual "+Math.round(aAct)+" h  \u00b7  forecast "+(st.finMs?fmtDate(st.finMs):"\u2014")+(varD!=null?("  \u00b7  "+(varD>0?("+"+varD+"d late"):(varD<0?(-varD+"d early"):"on plan"))):""));
+      let any=false;
+      aStages.forEach(stg=>{
+        const items=State.tasks.filter(t=>t.stageId===stg.id).sort((x,z)=>(x.seq||0)-(z.seq||0));
+        if(!items.length) return; any=true;
+        const sPlan=sum(items,t=>t.plannedLaborHours||0), sAct=sum(items,t=>t.actualLaborHours||0), sD=sAct-sPlan;
+        ensure(22); doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink);
+        doc.text(stg.sequence+".  "+stg.name, M, y);
+        doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub);
+        doc.text("plan "+Math.round(sPlan)+" h    \u00b7    act "+Math.round(sAct)+" h    \u00b7    var "+((sD>=0?"+":"")+Math.round(sD))+" h", W-M, y, {align:"right"}); y+=13;
+        const rows=items.map(t=>{ const aw=taskActualWorkers(t); const pc=clamp(t.percentComplete||0,0,100); const dlt=(t.actualLaborHours||0)-(t.plannedLaborHours||0);
+          return [ t.wbsCode||"", t.name, String(t.assignedWorkers||"\u2014"), aw?String(aw):"\u2014",
+            Math.round(t.plannedLaborHours||0)+"", (t.actualLaborHours||0)>0?Math.round(t.actualLaborHours)+"":"\u2014",
+            pc>0?((dlt>=0?"+":"")+Math.round(dlt)):"\u2014", pc+"%",
+            t.status==="COMPLETE"?"Done":(pc>0?"In progress":"Planned") ]; });
+        table(["WBS","Task",">Plan crew",">Act crew",">Plan h",">Act h",">Var h",">% done","Status"],
+          [40, CW-40-50-50-44-44-40-46-58, 50,50,44,44,40,46,58], rows,
+          { align:["l","l","r","r","r","r","r","r","l"],
+            cell:(ri,ci,cell)=>{ const t=items[ri]; if(!t) return null;
+              if(ci===6 && (t.percentComplete||0)>0){ const d=(t.actualLaborHours||0)-(t.plannedLaborHours||0); return d>0?C.red:C.green; }
+              if(ci===8) return cell==="Done"?C.green:(cell==="Planned"?C.sub:C.blue); return null; } });
+      });
+      if(!any){ ensure(14); doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor.apply(doc,C.sub); doc.text("No tasks on this aircraft yet.",M,y); y+=14; }
+    });
+    ensure(14); doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub);
+    doc.text("Plan crew = workers assigned   \u00b7   Act crew = workers checked in   \u00b7   Var h = actual minus planned labour   \u00b7   forecast finish respects real delays.", M, y); y+=14;
 
   }
 
@@ -4239,6 +4484,10 @@ document.addEventListener("click", (e)=>{
 
     case "new-labor": laborModal(null); break;
     case "edit-labor": laborModal(id); break;
+    case "skill-add": skillModal(null); break;
+    case "skill-edit": skillModal(id); break;
+    case "skill-save": skillSave(id||null); break;
+    case "skill-remove": skillRemove(id); break;
     case "save-labor": saveLabor(id||null); break;
     case "del-labor": deleteLabor(id); break;
 
@@ -4519,7 +4768,7 @@ async function init(){
   } else {
     seedIfEmpty();
   }
-  normalizeCalendars(); normalizeTasks();
+  normalizeCalendars(); normalizeTasks(); normalizeSkills();
   State.technicians=State.technicians||[]; State.timeSessions=State.timeSessions||[];
   { const hm=(location.hash||"").match(/task=([\w-]+)/);
     if(hm){ const tk=byId(State.tasks,hm[1]); if(tk){ const st=byId(State.stages,tk.stageId);
