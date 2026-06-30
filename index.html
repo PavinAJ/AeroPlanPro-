@@ -2120,7 +2120,7 @@ function viewDashboard(){
   const bn=Analytics.bottlenecks(pid);
   const conflicts=(sched&&sched.conflicts)||[];
 
-  const _behind={}; acs.forEach(a=>{ const stt=acStatus(a.id); if(stt.behind && !stt.released) _behind[stt.currentStation]=true; });
+  const _behind={}; acs.forEach(a=>{ const stt=acStatus(a.id); if((stt.behind||stt.delayed) && !stt.released) _behind[stt.currentStation]=true; });
   const _flow=programFlow(pid);
   const dashStationRows=_flow.map((stn,i)=>{ const mh=stationManHoursFleet(pid,stn.name);
     let label,cls; if(stn.status==="complete"){label="Completed";cls="ok";} else if(_behind[stn.name]){label="Delayed";cls="err";} else if(stn.status==="active"){label="In Progress";cls="info";} else {label="Not Started";cls="";}
@@ -2195,10 +2195,9 @@ function viewDashboard(){
       </div>
     </div>`;
 }
-function aircraftCompletion(acId){ const sts=State.stages.filter(s=>s.aircraftId===acId).map(s=>s.id);
-  const tasks=State.tasks.filter(t=>sts.includes(t.stageId)); if(!tasks.length) return 0;
-  const wOf=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
-  const tw=sum(tasks,wOf); return tw? round(sum(tasks,t=>wOf(t)*(t.percentComplete||0))/tw,0):0; }
+function aircraftCompletion(acId){ // station-normalised completion (matches the Production Line "Overall"),
+  // so one big early station can't inflate the figure. Labour-weighted value remains available via acStatus().laborPct.
+  return acStatus(acId).overall; }
 
 function viewHead(title, sub, actions){
   return `<div class="view-head"><h1>${esc(title)}</h1><span class="sub">${sub||""}</span><span class="spacer"></span>${actions||""}</div>`;
@@ -2513,19 +2512,35 @@ function acStatus(acId){
   const allTasks=groups.reduce((a,g)=>a.concat(g.tasks),[]);
   const wOf=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
   const totW=sum(allTasks,wOf);
-  const overall= totW? round(sum(allTasks,t=>wOf(t)*(t.percentComplete||0))/totW,0):0;
+  const laborPct= totW? round(sum(allTasks,t=>wOf(t)*(t.percentComplete||0))/totW,0):0;
   let curIdx=-1; for(let i=0;i<groups.length;i++){ const ts=groups[i].tasks; if(ts.length && ts.some(t=>t.status!=="COMPLETE")){ curIdx=i; break; } }
   const released= curIdx<0 && groups.some(g=>g.tasks.length);
   const started= allTasks.some(t=>(t.percentComplete||0)>0 || (t.status&&t.status!=="NOT_STARTED"));
   let stationPct=0; if(curIdx>=0){ const ts=groups[curIdx].tasks; const sw=sum(ts,wOf); stationPct= sw? round(sum(ts,t=>wOf(t)*(t.percentComplete||0))/sw,0):0; }
+  // Delayed = the CURRENT station has already burned more actual labour than planned, or holds a started task
+  // that is over its own planned hours, yet is not complete. The station stays current (we never advance off an
+  // incomplete task) — it is simply flagged Delayed so the floor sees it needs attention.
+  let delayed=false;
+  if(curIdx>=0){ const ts=groups[curIdx].tasks;
+    const plH=sum(ts,t=>(t.plannedLaborHours||0)), acH=sum(ts,t=>(t.actualLaborHours||0));
+    const anyStarted=ts.some(t=>(t.percentComplete||0)>0||(t.status&&t.status!=="NOT_STARTED"));
+    delayed = (anyStarted && plH>0 && acH>plH) ||
+      ts.some(t=>t.status!=="COMPLETE" && (t.plannedLaborHours||0)>0 && (t.actualLaborHours||0)>(t.plannedLaborHours||0) && ((t.percentComplete||0)>0||t.status==="WORKING")); }
+  const doneStations= curIdx<0?(released?stages.length:0):curIdx;
+  // OVERALL = average of each station's completion %, with every station weighted equally (station-normalized).
+  // For a normal sequential line this equals the runner's line position (finished stations + fraction of the
+  // current one); for parallel builds it also credits progress in any station. It deliberately does NOT weight
+  // by labour hours, so one big early station can't inflate the figure (kept as laborPct for reference).
+  const _stPcts= groups.map(g=>{ if(!g.tasks.length) return null; const sw=sum(g.tasks,wOf); return sw? sum(g.tasks,t=>wOf(t)*(t.percentComplete||0))/sw : 0; }).filter(x=>x!=null);
+  const overall= _stPcts.length? round(_stPcts.reduce((a,b)=>a+b,0)/_stPcts.length,0):0;
   const sched= ac? State.schedules[ac.programId] : null; let finMs=null,startMs=null;
   if(sched){ const ids=new Set(allTasks.map(t=>t.id)); const ss=sched.taskSchedules.filter(s=>ids.has(s.taskId));
     if(ss.length){ finMs=Math.max.apply(null,ss.map(s=>s.finishMs)); startMs=Math.min.apply(null,ss.map(s=>s.startMs)); } }
   const behind= finMs!=null && ac && ac.plannedFinishMs && finMs>ac.plannedFinishMs+DAY;
   return { ac, stages, totalStations:stages.length, currentSeq: curIdx>=0?groups[curIdx].stage.sequence:(released?stages.length+1:0),
     currentStation: released?"Released":(curIdx>=0?groups[curIdx].stage.name:(started?"In setup":"Not started")),
-    currentStageId: curIdx>=0?groups[curIdx].stage.id:null, doneStations: curIdx<0?(released?stages.length:0):curIdx,
-    stationPct, overall, released, started, finMs, startMs, behind };
+    currentStageId: curIdx>=0?groups[curIdx].stage.id:null, doneStations,
+    stationPct, overall, laborPct, released, started, finMs, startMs, behind, delayed };
 }
 function buildOrder(acs){ return acs.slice().sort((x,y)=> ((x.buildSeq||0)-(y.buildSeq||0)) || ((x.plannedStartMs||0)-(y.plannedStartMs||0)) || String(x.serialNumber||"").localeCompare(String(y.serialNumber||""),undefined,{numeric:true})); }
 function _flowW(t){ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; }
@@ -2568,7 +2583,7 @@ function viewLine(){
   const refStages=State.stages.filter(s=>s.aircraftId===sorted[0].id).sort((a,b)=>a.sequence-b.sequence).map(s=>s.name);
   const stats=sorted.map(a=>acStatus(a.id));
   const released=stats.filter(s=>s.released).length, building=stats.filter(s=>s.started&&!s.released).length, notStarted=stats.filter(s=>!s.started).length;
-  const behind=stats.filter(s=>s.behind).length;
+  const behind=stats.filter(s=>(s.behind||s.delayed)&&!s.released).length;
   const avg= stats.length? round(sum(stats,s=>s.overall)/stats.length,0):0;
 
   // station header labels
@@ -2576,8 +2591,11 @@ function viewLine(){
     +`<div class="st" style="left:99%;color:var(--green)">\u2691 Released</div>`;
   // runners
   const rows=stats.map(s=>{ const a=s.ac;
-    const pos= s.released?100: (s.started? clamp(s.overall,2,98) : 1.5);
-    const cls= s.released?"done": (s.behind?"behind": (s.started?"":"idle"));
+    // Position the runner BY STATION on the relay track (this view answers "which station is each tail at").
+    // It sits at the current station, advanced by progress through that station — not by overall labour %,
+    // which (with unequal station sizes) would drift the runner past the station the tail is actually in.
+    const pos= s.released?100: (s.started? clamp((s.doneStations + (s.stationPct||0)/100)/Math.max(1,s.totalStations)*100, 1.5, 99) : 1.5);
+    const cls= s.released?"done": ((s.behind||s.delayed)?"behind": (s.started?"":"idle"));
     const ticks=refStages.map((_,i)=>`<div class="tick" style="left:${((i+1)/maxSt*100).toFixed(2)}%"></div>`).join("");
     return `<div class="race-row"><div class="race-name" title="${esc(a.serialNumber)}">${esc(a.serialNumber)}</div>
       <div class="race-track">${ticks}<div class="race-fill" style="width:${pos}%"></div><div class="race-finish"></div>
@@ -2605,15 +2623,15 @@ function viewLine(){
     <div class="kpi"><div class="label">Aircraft</div><div class="val">${acs.length}</div><div class="meta">in this program</div></div>
     <div class="kpi"><div class="label">Released</div><div class="val" style="color:var(--green)">${released}</div><div class="meta">past the finish line</div></div>
     <div class="kpi"><div class="label">In build</div><div class="val" style="color:var(--accent)">${building}</div><div class="meta">on the line now</div></div>
-    <div class="kpi"><div class="label">Behind plan</div><div class="val" style="color:${behind?"var(--red)":"var(--ink)"}">${behind}</div><div class="meta">forecast past planned finish</div></div>
+    <div class="kpi"><div class="label">Delayed</div><div class="val" style="color:${behind?"var(--red)":"var(--ink)"}">${behind}</div><div class="meta">over planned hours or forecast late</div></div>
     <div class="kpi"><div class="label">Avg completion</div><div class="val">${avg}%</div><div class="meta">${notStarted} not started</div></div>
   </div>`;
 
   const tbl=`<div class="panel"><div class="panel-h"><span class="eyebrow">Status board</span><h3>Aircraft status</h3><span class="spacer"></span>
       <button class="btn sm" data-act="fleet-report">${icon("report","ico")} Status report (PDF)</button></div>
     <div class="panel-b"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>Serial</th><th>Model</th><th>Current station</th><th class="num">Station</th><th class="num">Overall</th><th>Status</th><th>Forecast finish</th><th>Order</th></tr></thead><tbody>${
-    stats.map((s,i)=>{ const a=s.ac; const stCls= s.released?"ok":(s.behind?"err":(s.started?"info":""));
-      const stLabel= s.released?"Released":(s.behind?"Behind":(s.started?"In build":"Not started"));
+    stats.map((s,i)=>{ const a=s.ac; const stCls= s.released?"ok":((s.delayed||s.behind)?"err":(s.started?"info":""));
+      const stLabel= s.released?"Released":(s.delayed?"Delayed":(s.behind?"Behind":(s.started?"In build":"Not started")));
       return `<tr><td>${i+1}</td><td><b>${esc(a.serialNumber)}</b></td><td>${esc(a.model)}</td>
         <td>${s.released?'<span style="color:var(--green)">\u2691 Released</span>':esc(s.currentStation)}</td>
         <td class="num">${s.released?"\u2014":s.stationPct+"%"}</td>
@@ -2623,7 +2641,7 @@ function viewLine(){
         <td style="white-space:nowrap"><button class="icobtn" data-act="line-build-up" data-id="${a.id}" title="Build earlier">\u25B2</button><button class="icobtn" data-act="line-build-down" data-id="${a.id}" title="Build later">\u25BC</button></td></tr>`; }).join("")
   }</tbody></table></div></div></div>`;
 
-  const behindNames={}; stats.forEach(st=>{ if(st.behind && !st.released) behindNames[st.currentStation]=true; });
+  const behindNames={}; stats.forEach(st=>{ if((st.behind||st.delayed) && !st.released) behindNames[st.currentStation]=true; });
   const dashRows=refStages.map((nm,i)=>{ const fl=stationFlowFleet(ap.id,nm); const mh=stationManHoursFleet(ap.id,nm);
     let label,cls; if(fl.status==="complete"){ label="Completed"; cls="ok"; }
     else if(behindNames[nm]){ label="Delayed"; cls="err"; }
@@ -3616,22 +3634,44 @@ postRender.efficiency=function(){ const ap=activeProgram(); if(!ap) return; cons
   if(lc.enough){ const cv=document.getElementById("lc-canvas"); if(cv) Chart.learningCurve(cv, lc.points, lc.curve, {obsMax:lc.obsMax, height:260}); } };
 
 
+function reportScopeModal(kind){
+  const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
+  const titleMap={executive:"Executive Summary",weekly:"Weekly Production",resource:"Resource Utilization",capacity:"Capacity Report",aircraft:"Aircraft Status",efficiency:"Efficiency & Learning Curve",progress:"Progress & Actuals"};
+  const models=[...new Set(State.aircraft.map(a=>a.model).filter(Boolean))].sort();
+  openModal((titleMap[kind]||"Report")+" \u2014 choose scope", `
+    <div class="field"><label>Generate report for</label>
+      <select id="rs_scope">
+        <option value="program">This program \u2014 ${esc(ap.name)}</option>
+        <option value="all">Whole fleet \u2014 all programs</option>
+        <option value="model">One model \u2014 all tails of a model</option>
+        <option value="aircraft">One serial number \u2014 a single tail</option>
+      </select></div>
+    <div class="field"><label>Serial number (for \u201cOne serial number\u201d)</label>
+      <select id="rs_aircraft"><option value="">\u2014 pick a tail \u2014</option>${State.aircraft.slice().sort((x,z)=>String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true})).map(a=>{const pr=byId(State.programs,a.programId);return `<option value="${a.id}">${esc(a.serialNumber)}${pr?" \u2014 "+esc(pr.name):""}</option>`;}).join("")}</select></div>
+    <div class="field"><label>Model (for \u201cOne model\u201d, or to filter any scope)</label>
+      <select id="rs_model"><option value="">All models</option>${models.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></div>
+    <div class="hint">Pick a single tail, every tail of one model, this program, or the whole fleet. The report\u2019s per-aircraft sections and totals follow your choice.</div>`,
+    `<button class="btn" data-act="m-close">Cancel</button>
+     <button class="btn primary" data-act="export-pdf-go" data-kind="${kind}">${icon("pdf","ico")} Generate PDF</button>`);
+}
+
 function fleetReportModal(){
   const progs=State.programs; if(!progs.length){ toast("No programs yet","warn"); return; }
   const ap=activeProgram();
   const models=[...new Set(State.aircraft.map(a=>a.model).filter(Boolean))].sort();
-  openModal("Fleet status report", `
-    <div class="field"><label>Scope</label>
+  openModal("Status report", `
+    <div class="field"><label>Generate report for</label>
       <select id="fr_scope">
         <option value="program">This program${ap?" \u2014 "+esc(ap.name):""}</option>
-        <option value="all">All programs (whole fleet)</option>
-        <option value="aircraft">One aircraft (pick the tail below)</option>
+        <option value="all">Whole fleet \u2014 all programs</option>
+        <option value="model">One model \u2014 all tails of a model</option>
+        <option value="aircraft">One serial number \u2014 a single tail</option>
       </select></div>
-    <div class="field"><label>Aircraft (for \u201cOne aircraft\u201d)</label>
-      <select id="fr_aircraft"><option value="">\u2014 all tails in scope \u2014</option>${State.aircraft.slice().sort((x,z)=>String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true})).map(a=>{const pr=byId(State.programs,a.programId);return `<option value="${a.id}">${esc(a.serialNumber)}${pr?" \u2014 "+esc(pr.name):""}</option>`;}).join("")}</select></div>
-    <div class="field"><label>Model filter</label>
+    <div class="field"><label>Serial number (for \u201cOne serial number\u201d)</label>
+      <select id="fr_aircraft"><option value="">\u2014 pick a tail \u2014</option>${State.aircraft.slice().sort((x,z)=>String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true})).map(a=>{const pr=byId(State.programs,a.programId);return `<option value="${a.id}">${esc(a.serialNumber)}${pr?" \u2014 "+esc(pr.name):""}</option>`;}).join("")}</select></div>
+    <div class="field"><label>Model (for \u201cOne model\u201d, or to filter any scope)</label>
       <select id="fr_model"><option value="">All models</option>${models.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></div>
-    <div class="hint">Builds a clear PDF: fleet summary, per-program roll-up, station and aircraft progress bars, an aircraft\u00d7station map, and a status table (current station, % complete, schedule variance). Pick \u201cAll programs\u201d for the whole fleet, one model, or a single tail.</div>`,
+    <div class="hint">Builds a clear shop-floor PDF: fleet summary, station and aircraft progress, an aircraft\u00d7station map, and a status table (current station, % complete, schedule variance). Choose a single serial number, every tail of one model, this program, or the whole fleet.</div>`,
     `<button class="btn" data-act="m-close">Cancel</button>
      <button class="btn" data-act="fleet-report-csv">${icon("download","ico")} CSV</button>
      <button class="btn primary" data-act="fleet-report-go">${icon("report","ico")} Generate PDF</button>`);
@@ -3639,7 +3679,7 @@ function fleetReportModal(){
 function fleetScopeAircraft(scope, model, acId){
   let acs;
   if(scope==="aircraft"){ const a=byId(State.aircraft,acId); return a?[a]:[]; }
-  if(scope==="all") acs=State.aircraft.slice();
+  if(scope==="all"||scope==="model") acs=State.aircraft.slice();   // "model" = all tails of a model across programs
   else { const ap=activeProgram(); acs=ap? State.aircraft.filter(a=>a.programId===ap.id):[]; }
   if(model) acs=acs.filter(a=>a.model===model);
   return acs;
@@ -3648,7 +3688,7 @@ function fleetReportCSV(){
   let scope=(document.getElementById("fr_scope")||{}).value||"program";
   const model=(document.getElementById("fr_model")||{}).value||"";
   const acId=(document.getElementById("fr_aircraft")||{}).value||"";
-  if(acId) scope="aircraft"; else if(scope==="aircraft") scope="program";
+  if(scope==="aircraft" && !acId){ toast("Pick a serial number for a single-tail report","warn"); return; }
   const acs=fleetScopeAircraft(scope,model,acId); closeModal();
   if(!acs.length){ toast("No aircraft in scope","warn"); return; }
   const rows=[["Program","Serial","Model","BuildRev","CurrentStation","StationPct","OverallPct","Status","PlannedFinish","ForecastFinish","VarianceDays"]];
@@ -3664,7 +3704,7 @@ function exportFleetPDF(){
   let scope=(document.getElementById("fr_scope")||{}).value||"program";
   const model=(document.getElementById("fr_model")||{}).value||"";
   const acId=(document.getElementById("fr_aircraft")||{}).value||"";
-  if(acId) scope="aircraft"; else if(scope==="aircraft") scope="program";
+  if(scope==="aircraft" && !acId){ toast("Pick a serial number for a single-tail report","warn"); return; }
   closeModal();
   const doc=pdfDoc(); if(!doc){ toast("PDF engine offline \u2014 use Print \u2192 Save as PDF","warn"); return; }
   const acs=fleetScopeAircraft(scope,model,acId);
@@ -3789,7 +3829,7 @@ function exportFleetPDF(){
   doc.save(("fleet-status-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_")); toast("Fleet status report exported");
 }
 
-function exportPDF(kind){
+function exportPDF(kind, scopeOpt){
   const doc=pdfDoc();
   if(!doc){ toast("PDF engine offline \u2014 use your browser's Print \u2192 Save as PDF","warn"); return; }
   const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
@@ -3817,9 +3857,9 @@ function exportPDF(kind){
     doc.text("Generated "+new Date().toLocaleString(), W-M, 50, {align:"right"});
     // program meta band
     doc.setFillColor(244,247,250); doc.rect(0,71,W,30,"F");
-    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(ap.name,M,90);
+    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(scopeLabel||ap.name,M,90);
     doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.sub);
-    doc.text(ap.code+"   \u00b7   Status: "+ap.status+"   \u00b7   "+acs.length+" aircraft   \u00b7   "+State.tasks.filter(t=>t.programId===ap.id).length+" tasks", W-M, 90, {align:"right"});
+    doc.text((ap.code||"")+"   \u00b7   "+acs.length+" aircraft   \u00b7   "+allTasks.length+" tasks", W-M, 90, {align:"right"});
     y=120;
   }
   function ensure(h){ if(y+h>H-44){ doc.addPage(); y=52; } }
@@ -3905,11 +3945,21 @@ function exportPDF(kind){
 
   const e=Analytics.evm(ap.id)||{BAC:0,EV:0,AC:0,PV:0,SV:0,CV:0,SPI:1,CPI:1,EAC:0,ETC:0,pctComplete:0};
   const fc=Analytics.forecast(ap.id); const u=Analytics.utilizationSummary(ap.id);
-  const acs=State.aircraft.filter(a=>a.programId===ap.id);
+  // ---- report scope: which tails this report covers (tail / model / program / whole fleet) ----
+  const _sc = (scopeOpt && scopeOpt.scope) ? scopeOpt : {scope:"program",model:"",acId:""};
+  const acs = fleetScopeAircraft(_sc.scope, _sc.model||"", _sc.acId||"");
+  const _acIds=new Set(acs.map(a=>a.id));
+  const _stIds=new Set(State.stages.filter(s=>_acIds.has(s.aircraftId)).map(s=>s.id));
+  const allTasks=State.tasks.filter(t=>_stIds.has(t.stageId));
+  // merge schedules across every program the scoped tails belong to, so cross-program scopes still show dates
+  const _progIds=new Set(acs.map(a=>a.programId)); const map={};
+  _progIds.forEach(pid=>{ const sc2=State.schedules[pid]; if(sc2) sc2.taskSchedules.forEach(ts=>map[ts.taskId]=ts); });
   const sched=State.schedules[ap.id];
-  const allTasks=State.tasks.filter(t=>t.programId===ap.id);
-  const critCount= sched? sched.taskSchedules.filter(s=>s.onCriticalPath).length : 0;
-  const map={}; if(sched) sched.taskSchedules.forEach(s=>map[s.taskId]=s);
+  const critCount= allTasks.reduce((n,t)=>n+((map[t.id]&&map[t.id].onCriticalPath)?1:0),0);
+  const scopeLabel = _sc.scope==="aircraft" ? ("Tail "+((byId(State.aircraft,_sc.acId)||{}).serialNumber||"\u2014"))
+    : _sc.scope==="all" ? ("Whole fleet"+(_sc.model?" \u00b7 "+_sc.model:""))
+    : _sc.scope==="model" ? ("All tails \u00b7 model "+(_sc.model||"all"))
+    : (ap.name+(_sc.model?" \u00b7 "+_sc.model:""));
   const currentStage=(acId)=>{ const sts=State.stages.filter(s=>s.aircraftId===acId).sort((a,b)=>a.sequence-b.sequence);
     for(const st of sts){ const tk=State.tasks.filter(t=>t.stageId===st.id); if(tk.length && tk.some(t=>t.status!=="COMPLETE")) return st.name; }
     return sts.length?"Released":"\u2014"; };
@@ -4083,7 +4133,9 @@ function exportPDF(kind){
       const sts=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
       table(["#","Stage","Tasks","Man-h","Done","Stage %"],[30,CW-372,58,70,58,90],
         sts.map(st=>{ const tk=State.tasks.filter(t=>t.stageId===st.id); const dn=tk.filter(t=>t.status==="COMPLETE").length;
-          const pct= tk.length? round(dn/tk.length*100,0):0; return [st.sequence,st.name,tk.length,stageManHours(st.id),dn,pct+"%"]; }),
+          // labour-weighted within the station, matching the flow chart and the Production Line "Station %"
+          const sw=sum(tk,_flowW); const pct= sw? round(sum(tk,t=>_flowW(t)*(t.percentComplete||0))/sw,0):0;
+          return [st.sequence,st.name,tk.length,stageManHours(st.id),dn,pct+"%"]; }),
         {align:["r","l","r","r","r","r"],cell:(r,c,v)=> c===5?pctCol(parseFloat(v)):null});
       section("Production Schedule","planned start to finish  \u00b7  durations  \u00b7  critical path");
       scheduleTable(a.id);
@@ -4134,10 +4186,10 @@ function exportPDF(kind){
     paragraph(an);
 
   } else if(kind==="progress"){
-    const acs2=State.aircraft.filter(a=>a.programId===ap.id).sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
-    const sc=State.schedules[ap.id]; const smap={}; if(sc) sc.taskSchedules.forEach(s=>smap[s.taskId]=s);
+    const acs2=acs.slice().sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
+    const smap=map;
     const e=Analytics.evm(ap.id)||{SPI:1,CPI:1};
-    const pTasks=State.tasks.filter(t=>t.programId===ap.id);
+    const pTasks=allTasks;
     const planH=sum(pTasks,t=>t.plannedLaborHours||0), actH=sum(pTasks,t=>t.actualLaborHours||0);
     metricBand([
       {label:"Planned labour", value:Math.round(planH)+" h", sub:"standard hours", color:C.blue},
@@ -4497,7 +4549,13 @@ document.addEventListener("click", (e)=>{
     case "del-equip": deleteEquip(id); break;
 
     case "export-csv": exportCSV(kind||"tasks"); break;
-    case "export-pdf": exportPDF(kind||"executive"); break;
+    case "export-pdf": reportScopeModal(kind||"executive"); break;
+    case "export-pdf-go": {
+      const scope=(document.getElementById("rs_scope")||{}).value||"program";
+      const model=(document.getElementById("rs_model")||{}).value||"";
+      const acId=(document.getElementById("rs_aircraft")||{}).value||"";
+      if(scope==="aircraft" && !acId){ toast("Pick a serial number for a single-tail report","warn"); break; }
+      closeModal(); exportPDF(kind||"executive",{scope,model,acId}); break; }
 
     case "save-template": saveTemplateModal(); break;
     case "commit-template": commitTemplate(); break;
