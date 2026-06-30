@@ -8,9 +8,9 @@
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-<meta name="apple-mobile-web-app-title" content="AeroPlan Pro" />
+<meta name="apple-mobile-web-app-title" content="CompositePlan Pro" />
 <link rel="manifest" id="manifest-link" />
-<title>AeroPlan Pro — UAV Manufacturing Planning</title>
+<title>CompositePlan Pro — Composite Manufacturing Planning</title>
 
 <!-- jsPDF (PDF export). Loaded from CDN; app degrades gracefully if unavailable. -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -106,6 +106,18 @@ html[data-theme="sandstone"] {
   --ink:#3a322a; --ink-2:#6b5f50; --ink-3:#9a8b76; --accent:#b06a2c; --accent-2:#c98a3a;
   --amber:#b45309; --green:#3f7d4f; --red:#b3413c; --blue:#3b6ea5; --orange:#c2410c; --grey:#9a8b76; --chip:#f3ede3;
   --shadow:0 1px 0 rgba(0,0,0,.04), 0 6px 18px rgba(80,60,30,.10);
+}
+
+html[data-theme="steel"] {
+  --bg:#0f141b; --bg-2:#141a23; --panel:#1a212c; --panel-2:#1f2733; --line:#2a333f; --line-2:#374251;
+  --ink:#eef2f7; --ink-2:#a7b4c4; --ink-3:#6c7a8c; --accent:#5b9bd5; --accent-2:#7ab0e0;
+  --amber:#e0a73a; --green:#46b17f; --red:#e0556b; --blue:#6ea8e8; --orange:#e0884a; --grey:#6c7a8c; --chip:#10161e;
+}
+html[data-theme="porcelain"] {
+  --bg:#f5f6f8; --bg-2:#eef0f3; --panel:#ffffff; --panel-2:#f7f8fa; --line:#e3e7ec; --line-2:#ced5de;
+  --ink:#1a2230; --ink-2:#48566a; --ink-3:#7d8a9c; --accent:#3f5bd9; --accent-2:#5b73e0;
+  --amber:#b45309; --green:#0f7a52; --red:#c5364b; --blue:#2b54c8; --orange:#c2410c; --grey:#7d8a9c; --chip:#eef1f5;
+  --shadow:0 1px 0 rgba(0,0,0,.04), 0 6px 18px rgba(30,45,80,.08);
 }
 
 * { box-sizing: border-box; }
@@ -360,7 +372,14 @@ canvas { display:block; }
 .logoprev img { max-width:100%; max-height:100%; object-fit:contain; }
 .logoprev .mono { font-family:var(--font-display); font-weight:800; color:var(--accent); font-size:20px; letter-spacing:.04em; }
 .brand .glyph img { width:100%; height:100%; object-fit:contain; border-radius:7px; }
+.brand .glyph.has-logo { background:none; box-shadow:none; }
+.logoprev.has-logo { background:none; border-color:transparent; }
 .minihint { font-size:10.5px; color:var(--ink-3); margin-top:4px; }
+.lc-legend{ display:flex; gap:14px; font-size:10.5px; color:var(--ink-3); margin-top:6px; flex-wrap:wrap; }
+.lc-legend i{ display:inline-block; width:11px; height:3px; border-radius:2px; vertical-align:middle; margin-right:4px; }
+.lc-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(215px,1fr)); gap:12px; }
+.lc-cell{ border:1px solid var(--line); border-radius:var(--r); padding:8px 8px 4px; background:var(--panel-2); }
+.lc-title{ font-size:11px; font-weight:600; color:var(--ink-2); margin-bottom:2px; }
 .lbl { display:block; font-size:11px; color:var(--ink-2); letter-spacing:.03em; font-weight:600; }
 
 .gantt-tip { position:absolute; z-index:20; display:none; pointer-events:none; max-width:220px;
@@ -458,9 +477,10 @@ const DEP_MEANING = {
 const THEMES=[
   {id:"dark",name:"Midnight (dark)"}, {id:"ocean",name:"Ocean (dark)"}, {id:"graphite",name:"Graphite (dark)"},
   {id:"nord",name:"Nord (dark)"}, {id:"solarized",name:"Solarized (dark)"}, {id:"contrast",name:"High-contrast"},
-  {id:"light",name:"Daylight (light)"}, {id:"sandstone",name:"Sandstone (light)"}
+  {id:"light",name:"Daylight (light)"}, {id:"sandstone",name:"Sandstone (light)"}, {id:"porcelain",name:"Porcelain (light)"},
+  {id:"steel",name:"Steel (dark)"}
 ];
-const LIGHT_THEMES=["light","sandstone"];
+const LIGHT_THEMES=["light","sandstone","porcelain"];
 const ALLOC_MODES = ["FIXED","OPTIMIZE"];
 const PHASES = ["WORK","CURE","COOL","BOTH"];
 
@@ -580,7 +600,8 @@ const State = {
   scenarios:[], templates:[], schedules:{}, /* programId -> Schedule */
   technicians:[], timeSessions:[], skills:[],
   settings:{ userLabel:"Planner", theme:"dark", hoursPerDay:8, projectStartMs:null,
-             companyName:"AeroPlan Pro", logoText:"APP", logoDataUrl:null },
+             appName:"CompositePlan Pro", appTagline:"COMPOSITE MANUFACTURING \u00b7 MES",
+             companyName:"", logoText:"CP", logoDataUrl:null },
   ui:{ module:"dashboard", activeProgram:null, activeAircraft:null, activeStage:null,
        taskFilter:"", lastConflicts:[], collapsedStages:{}, ganttCriticalOnly:false, ganttShowActual:true,
        checkinTech:null, checkinAircraft:null, checkinTask:null, checkinWorkers:1 }
@@ -1078,18 +1099,27 @@ const Engine = (function(){
     const buildIdx={}; Object.keys(_grp).forEach(g=>{ _grp[g].slice().sort((x,y)=> ((x.buildSeq||0)-(y.buildSeq||0)) || ((x.plannedStartMs||0)-(y.plannedStartMs||0)) || String(x.serialNumber||"").localeCompare(String(y.serialNumber||""),undefined,{numeric:true})).forEach((a,i)=>buildIdx[a.id]=i); });
     tasks.forEach(t=>{ const inf=stInfo[t.id]; if(inf){ inf.grp= inf.ac!=null? grpOf(inf.ac):"ALL"; inf.bi= inf.ac!=null? (buildIdx[inf.ac]||0):0; } });
     const stageMax={}; // aircraftId -> { stageSeq -> max release(finish)Ms }
+    // transitive predecessors — dependency order is ABSOLUTE and must outrank priority/sequence/float
+    const _tpred={}; (function(){ function tp(id){ if(_tpred[id]) return _tpred[id]; const s=new Set();
+      (c.preds[id]||[]).forEach(d=>{ s.add(d.predecessorId); tp(d.predecessorId).forEach(x=>s.add(x)); }); return (_tpred[id]=s); } c.order.forEach(tp); })();
     const order=[...c.order].sort((a,b)=>{
+      if(_tpred[a] && _tpred[a].has(b)) return 1;    // a depends on b -> place b first
+      if(_tpred[b] && _tpred[b].has(a)) return -1;   // b depends on a -> place a first
       const A=stInfo[a]||{}, B=stInfo[b]||{};
+      const pa=(byId(tasks,a)||{}).priority||0, pb=(byId(tasks,b)||{}).priority||0;
       if(lineMode!=="off"){
         // Flow line: process tail-by-tail (build order) within each scope group, in station order.
         if((A.grp||"")!==(B.grp||"")) return (A.grp||"")<(B.grp||"")?-1:1;
         if((A.bi||0)!==(B.bi||0)) return (A.bi||0)-(B.bi||0);
         if(A.seq!==B.seq) return A.seq-B.seq;
+        if(pa!==pb) return pb-pa;                     // higher priority first within a station
         if((A.tseq||0)!==(B.tseq||0)) return (A.tseq||0)-(B.tseq||0);
-      } else if(A.ac===B.ac){ if(A.seq!==B.seq) return A.seq-B.seq; if(A.tseq!==B.tseq) return (A.tseq||0)-(B.tseq||0); }
+      } else if(A.ac===B.ac){ if(A.seq!==B.seq) return A.seq-B.seq;
+        if(pa!==pb) return pb-pa;                     // higher priority first within a stage
+        if(A.tseq!==B.tseq) return (A.tseq||0)-(B.tseq||0); }
       const ca=c.cpm[a]||{floatMin:1e9}, cb=c.cpm[b]||{floatMin:1e9};
       if(ca.floatMin!==cb.floatMin) return ca.floatMin-cb.floatMin;
-      const ta=byId(tasks,a)||{priority:0}, tb=byId(tasks,b)||{priority:0}; return (tb.priority||0)-(ta.priority||0); });
+      return pb-pa; });
     const lineState={};
     // DATA DATE (status date): once a program has any actual progress, remaining/forecast work cannot
     // be scheduled in the past. Completed work is pinned to its actual timing so real delays push successors.
@@ -1824,7 +1854,7 @@ const Gantt2 = (function(){
     const ap=activeProgram&&activeProgram(); const acName=(State.ui.activeAircraft&&byId(State.aircraft,State.ui.activeAircraft))? byId(State.aircraft,State.ui.activeAircraft).serialNumber:"";
     const taskRows=cur.rows.filter(r=>!r.isGroup); const crit=taskRows.filter(r=>r.critical).length;
     const sMin=Math.min(...taskRows.map(r=>r.startMs)), fMax=Math.max(...taskRows.map(r=>r.finishMs));
-    const title=(State.settings.companyName||"AeroPlan Pro");
+    const title=(State.settings.companyName||(State.settings.appName||"CompositePlan Pro"));
     const w=window.open("","_blank"); if(!w){ toast("Allow pop-ups to print the Gantt"); return; }
     const legend='<span><i style="background:#38bdf8"></i>Work</span><span><i style="background:#fb923c"></i>Cure</span><span><i style="background:#fbbf24"></i>Cool</span><span><i style="background:#f43f5e"></i>Critical path</span><span><i style="background:#34d399"></i>Complete</span><span><i style="border:1px dashed #94a3b8"></i>Planned len</span><span><i style="background:#fbbf24"></i>Actual / % done</span>';
     let html='<html><head><title>'+esc(title)+' \u2014 Production Schedule</title><style>'+
@@ -1896,7 +1926,7 @@ const Gantt2 = (function(){
     const sMin=Math.min.apply(null,tasks.map(t=>t.startMs)), fMax=Math.max.apply(null,tasks.map(t=>t.finishMs));
     const d0=dayMid(sMin), dEnd=dayMid(fMax);
     const ap=activeProgram&&activeProgram(); const acName=(State.ui.activeAircraft&&byId(State.aircraft,State.ui.activeAircraft))? byId(State.aircraft,State.ui.activeAircraft).serialNumber:"";
-    const title=(State.settings.companyName||"AeroPlan Pro");
+    const title=(State.settings.companyName||(State.settings.appName||"CompositePlan Pro"));
     const dfmt=(ms)=>new Date(ms).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"});
 
     let inner="", rangeNote="";
@@ -2048,8 +2078,8 @@ function shellHTML(){
     <header class="header">
       <button class="hamburger" data-act="toggle-nav" aria-label="Menu">${icon("menu")}</button>
       <div class="brand">
-        <div class="glyph">${State.settings.logoDataUrl?`<img src="${State.settings.logoDataUrl}" alt="logo">`:esc((State.settings.logoText||"APP").slice(0,3))}</div>
-        <div><div class="name">Aero<b>Plan</b> Pro</div><div class="ver">UAV MANUFACTURING · MES</div></div>
+        <div class="glyph${State.settings.logoDataUrl?' has-logo':''}">${State.settings.logoDataUrl?`<img src="${State.settings.logoDataUrl}" alt="logo">`:esc((State.settings.logoText||"CP").slice(0,3))}</div>
+        <div>${(function(){const nm=(State.settings.appName||"CompositePlan Pro").trim();const i=nm.lastIndexOf(" ");const a=i>0?nm.slice(0,i):nm,b=i>0?nm.slice(i+1):"";return '<div class="name">'+esc(a)+(b?' <b>'+esc(b)+'</b>':'')+'</div>';})()}<div class="ver">${esc(State.settings.appTagline||"COMPOSITE MANUFACTURING \u00b7 MES")}</div></div>
       </div>
       <div class="spacer"></div>
       <div class="h-prog">
@@ -2093,13 +2123,44 @@ const postRender={};
 function statusChip(status){ const s=STATUS[status]||STATUS.NOT_STARTED;
   return `<span class="chip ${s.cls}"><span class="dot"></span>${s.label}</span>`; }
 function progArc(programId){ const tasks=State.tasks.filter(t=>t.programId===programId);
-  if(!tasks.length) return 0; return round(sum(tasks,t=>t.percentComplete||0)/tasks.length,0); }
+  if(!tasks.length) return 0;
+  // PLANNED-HOUR-WEIGHTED so the dashboard headline matches the per-tail bars, the production line, and the reports.
+  const wOf=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
+  const tot=sum(tasks,wOf); return tot? round(sum(tasks,t=>wOf(t)*(t.percentComplete||0))/tot,0):0; }
 
 function emptyState(iconName, title, body, action){
   return `<div class="empty">${icon(iconName,"ico")}<h4>${esc(title)}</h4><p class="muted">${esc(body)}</p>${action||""}</div>`;
 }
 
 /* ---------- DASHBOARD ---------- */
+// ---- reusable inline SVG line chart (theme-aware, crisp on screen) ----
+function svgLine(W,H,labels,series,opts){ opts=opts||{};
+  const padL=opts.noY?10:34, padR=10, padT=8, padB=18; const pw=W-padL-padR, ph=H-padT-padB;
+  let vals=[]; series.forEach(s=>s.pts.forEach(v=>{ if(v!=null&&isFinite(v)) vals.push(v); })); if(opts.extra!=null) vals.push(opts.extra);
+  const maxV=Math.max(1,...vals)*1.15; const n=labels.length;
+  const X=i=> n>1? padL+pw*i/(n-1): padL+pw/2; const Y=v=> padT+ph*(1-v/maxV);
+  let g="";
+  for(let k=0;k<=3;k++){ const yy=padT+ph*k/3; g+=`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${(W-padR).toFixed(1)}" y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="1" opacity=".55"/>`;
+    if(!opts.noY) g+=`<text x="${padL-4}" y="${(yy+3).toFixed(1)}" text-anchor="end" font-size="8.5" fill="var(--ink-3)">${Math.round(maxV*(1-k/3))}</text>`; }
+  labels.forEach((lb,i)=>{ if(n>(opts.maxX||10)&&i%2===1) return; g+=`<text x="${X(i).toFixed(1)}" y="${H-5}" text-anchor="middle" font-size="8.5" fill="var(--ink-3)">${esc(String(lb))}</text>`; });
+  series.forEach(s=>{ const col=s.color||"var(--accent)";
+    if(!s.dotsOnly){ let d="",st=false; s.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)){ st=false; return; } const cx=X(i),cy=Y(v); d+=(st?"L":"M")+cx.toFixed(1)+" "+cy.toFixed(1)+" "; st=true; });
+      if(d) g+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="${s.dashed?1.3:2}" ${s.dashed?'stroke-dasharray="4 3"':''} stroke-linejoin="round"/>`; }
+    s.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)) return; if(s.dotR===0) return; g+=`<circle cx="${X(i).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="${s.dotR||2.6}" fill="${col}"/>`; }); });
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block" preserveAspectRatio="xMidYMid meet">${g}</svg>`;
+}
+// ---- per-tail / per-station learning data (actual vs planned target) ----
+function learningModel(acsList){
+  const wOfp=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
+  const units=acsList.slice().sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
+  const U=units.map(a=>{ const stps=State.stages.filter(s=>s.aircraftId===a.id).sort((p,q)=>p.sequence-q.sequence);
+    const rows=stps.map(s=>{ const tk=State.tasks.filter(t=>t.stageId===s.id); const plan=sum(tk,t=>t.plannedLaborHours||0), act=sum(tk,t=>t.actualLaborHours||0);
+      const sw=sum(tk,wOfp); const pct= sw? Math.round(sum(tk,t=>wOfp(t)*(t.percentComplete||0))/sw):0; return {name:s.name,plan,act,pct}; });
+    return {serial:a.serialNumber, plan:sum(rows,r=>r.plan), act:sum(rows,r=>r.act), pct:aircraftCompletion(a.id), rows}; });
+  const ref=U.reduce((a,b)=>(b.rows.length>a.rows.length?b:a), U[0]||{rows:[]});
+  const stations=(ref.rows||[]).map(rr=>({name:rr.name, target:rr.plan||0, ser:U.map(u=>{ const r=u.rows.find(x=>x.name===rr.name); return {act:r&&r.act>0?r.act:null, done:r?r.pct>=100:false}; })}));
+  return {U, stations};
+}
 function viewDashboard(){
   const ap=activeProgram();
   if(!ap) return viewHead("Dashboard","Program overview")+emptyState("program","No active program","Create a program to begin planning.",
@@ -2162,8 +2223,30 @@ function viewDashboard(){
         <div class="panel-b">${dashStationRows||'<span class="muted">No stations yet</span>'}</div>
       </div>
       <div class="panel">
-        <div class="panel-h"><span class="eyebrow">Efficiency</span><h3>Learning curve</h3><span class="spacer"></span>${_lc.enough?`<span class="muted" style="font-size:11px">${_lc.LR}% rate</span>`:""}</div>
-        <div class="panel-b">${_lc.enough? `<canvas id="dash-lc" style="width:100%;height:220px"></canvas><div class="muted" style="font-size:11px;margin-top:6px">Labor per unit is dropping about ${_lc.slopePct}% each time output doubles.</div>` : `<div class="empty" style="padding:24px">${icon("chart","ico")}<h4>Not enough built units yet</h4><p class="muted">Finish 2+ aircraft and the learning curve (and projected hours for the next tails) appears here.</p></div>`}</div>
+        <div class="panel-h"><span class="eyebrow">Efficiency</span><h3>Learning curve</h3><span class="spacer"></span><span class="muted" style="font-size:11px">actual vs planned target</span></div>
+        <div class="panel-b">${(function(){ const LM=learningModel(acs); const U=LM.U; const built=U.filter(u=>u.act>0);
+          if(!built.length) return `<div class="empty" style="padding:24px">${icon("chart","ico")}<h4>No actual hours yet</h4><p class="muted">Planned hours are the target. Log actual labour and each tail's total hours appear here, with the goal of driving them down to the target.</p></div>`;
+          const labels=U.map(u=>u.serial);
+          const target=U.map(u=>Math.round(u.plan)), done=U.map(u=>(u.act>0&&u.pct>=100)?Math.round(u.act):null), ip=U.map(u=>(u.act>0&&u.pct<100)?Math.round(u.act):null);
+          const series=[{color:"var(--ink-3)",dashed:true,pts:target,dotR:0},{color:"var(--green)",pts:done}];
+          if(ip.some(v=>v!=null)) series.push({color:"var(--amber)",dotsOnly:true,pts:ip});
+          const doneU=built.filter(u=>u.pct>=100); let note="Dashed line = planned target; the goal is to bring each tail down to it.";
+          if(doneU.length>=2){ const f=doneU[0], l=doneU[doneU.length-1]; const fo=f.plan?Math.round((f.act-f.plan)/f.plan*100):0, lo=l.plan?Math.round((l.act-l.plan)/l.plan*100):0; note="First tail ran +"+fo+"% over target; latest ("+esc(l.serial)+") "+(lo>=0?"+":"")+lo+"% \u2014 "+(lo<fo?"closing on target.":"not closing yet."); }
+          return svgLine(520,210,labels,series,{maxX:8})+`<div class="lc-legend"><span><i style="background:var(--green)"></i>actual (done)</span><span><i style="background:var(--amber)"></i>in build</span><span><i style="background:var(--ink-3)"></i>target</span></div><div class="muted" style="font-size:11px;margin-top:4px">${note}</div>`; })()}</div>
+      </div>
+    </div>
+
+    <div class="grid cols-1" style="margin-top:14px">
+      <div class="panel">
+        <div class="panel-h"><span class="eyebrow">Efficiency</span><h3>Each station's learning curve</h3><span class="spacer"></span><span class="muted" style="font-size:11px">same station across tails \u00b7 actual vs target</span></div>
+        <div class="panel-b">${(function(){ const LM=learningModel(acs); const withAct=LM.stations.filter(st=>st.ser.some(p=>p.act!=null));
+          if(!withAct.length) return `<div class="empty" style="padding:20px">${icon("chart","ico")}<h4>No station hours yet</h4><p class="muted">Log actual hours by station and each station's curve toward its planned target appears here.</p></div>`;
+          const labels=LM.U.map(u=>u.serial);
+          return '<div class="lc-grid">'+withAct.map(st=>{ const target=labels.map(()=>Math.round(st.target));
+            const doneP=st.ser.map(p=>(p.act!=null&&p.done)?Math.round(p.act):null), ipP=st.ser.map(p=>(p.act!=null&&!p.done)?Math.round(p.act):null);
+            const series=[{color:"var(--ink-3)",dashed:true,pts:target,dotR:0},{color:"var(--green)",pts:doneP},{color:"var(--amber)",dotsOnly:true,pts:ipP}];
+            return '<div class="lc-cell"><div class="lc-title">'+esc(st.name)+' <span class="muted" style="font-weight:400">\u00b7 target '+Math.round(st.target)+'h</span></div>'+svgLine(220,118,labels,series,{maxX:5})+'</div>'; }).join("")+'</div>'+
+            '<div class="lc-legend"><span><i style="background:var(--green)"></i>actual (done)</span><span><i style="background:var(--amber)"></i>in build</span><span><i style="background:var(--ink-3)"></i>planned target</span></div>'; })()}</div>
       </div>
     </div>
 
@@ -2195,8 +2278,8 @@ function viewDashboard(){
       </div>
     </div>`;
 }
-function aircraftCompletion(acId){ // station-normalised completion (matches the Production Line "Overall"),
-  // so one big early station can't inflate the figure. Labour-weighted value remains available via acStatus().laborPct.
+function aircraftCompletion(acId){ // planned-hour-weighted completion (matches the Production Line "Overall",
+  // the dashboard headline, and the reports) so the heavy stages count for more.
   return acStatus(acId).overall; }
 
 function viewHead(title, sub, actions){
@@ -2246,6 +2329,7 @@ function viewAircraft(){
         <h3 class="mono">${esc(a.serialNumber)}</h3><span class="spacer"></span>
         <button class="btn sm" data-act="edit-aircraft" data-id="${a.id}">${icon("edit","ico")}</button>
         <button class="btn sm" data-act="dup-aircraft" data-id="${a.id}" title="Duplicate aircraft">${icon("copy","ico")}</button>
+        <button class="btn sm" data-act="copy-build" data-id="${a.id}" title="Copy build with data &amp; new dates">${icon("copy","ico")} Copy</button>
         <button class="btn sm danger" data-act="delete-aircraft" data-id="${a.id}">${icon("trash","ico")}</button></div>
       <div class="panel-b">
         <div class="kv">
@@ -2512,7 +2596,9 @@ function acStatus(acId){
   const allTasks=groups.reduce((a,g)=>a.concat(g.tasks),[]);
   const wOf=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
   const totW=sum(allTasks,wOf);
-  const laborPct= totW? round(sum(allTasks,t=>wOf(t)*(t.percentComplete||0))/totW,0):0;
+  // OVERALL = planned-hour-weighted % complete (a station holding more of the planned hours counts for more,
+  // so completing the heavy early stages reads high, not just "n of N stations"). This is the headline build %.
+  const overall= totW? round(sum(allTasks,t=>wOf(t)*(t.percentComplete||0))/totW,0):0;
   let curIdx=-1; for(let i=0;i<groups.length;i++){ const ts=groups[i].tasks; if(ts.length && ts.some(t=>t.status!=="COMPLETE")){ curIdx=i; break; } }
   const released= curIdx<0 && groups.some(g=>g.tasks.length);
   const started= allTasks.some(t=>(t.percentComplete||0)>0 || (t.status&&t.status!=="NOT_STARTED"));
@@ -2527,12 +2613,6 @@ function acStatus(acId){
     delayed = (anyStarted && plH>0 && acH>plH) ||
       ts.some(t=>t.status!=="COMPLETE" && (t.plannedLaborHours||0)>0 && (t.actualLaborHours||0)>(t.plannedLaborHours||0) && ((t.percentComplete||0)>0||t.status==="WORKING")); }
   const doneStations= curIdx<0?(released?stages.length:0):curIdx;
-  // OVERALL = average of each station's completion %, with every station weighted equally (station-normalized).
-  // For a normal sequential line this equals the runner's line position (finished stations + fraction of the
-  // current one); for parallel builds it also credits progress in any station. It deliberately does NOT weight
-  // by labour hours, so one big early station can't inflate the figure (kept as laborPct for reference).
-  const _stPcts= groups.map(g=>{ if(!g.tasks.length) return null; const sw=sum(g.tasks,wOf); return sw? sum(g.tasks,t=>wOf(t)*(t.percentComplete||0))/sw : 0; }).filter(x=>x!=null);
-  const overall= _stPcts.length? round(_stPcts.reduce((a,b)=>a+b,0)/_stPcts.length,0):0;
   const sched= ac? State.schedules[ac.programId] : null; let finMs=null,startMs=null;
   if(sched){ const ids=new Set(allTasks.map(t=>t.id)); const ss=sched.taskSchedules.filter(s=>ids.has(s.taskId));
     if(ss.length){ finMs=Math.max.apply(null,ss.map(s=>s.finishMs)); startMs=Math.min.apply(null,ss.map(s=>s.startMs)); } }
@@ -2540,7 +2620,7 @@ function acStatus(acId){
   return { ac, stages, totalStations:stages.length, currentSeq: curIdx>=0?groups[curIdx].stage.sequence:(released?stages.length+1:0),
     currentStation: released?"Released":(curIdx>=0?groups[curIdx].stage.name:(started?"In setup":"Not started")),
     currentStageId: curIdx>=0?groups[curIdx].stage.id:null, doneStations,
-    stationPct, overall, laborPct, released, started, finMs, startMs, behind, delayed };
+    stationPct, overall, released, started, finMs, startMs, behind, delayed };
 }
 function buildOrder(acs){ return acs.slice().sort((x,y)=> ((x.buildSeq||0)-(y.buildSeq||0)) || ((x.plannedStartMs||0)-(y.plannedStartMs||0)) || String(x.serialNumber||"").localeCompare(String(y.serialNumber||""),undefined,{numeric:true})); }
 function _flowW(t){ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; }
@@ -2707,17 +2787,18 @@ function viewReports(){
         <div class="panel-b">
           <p class="muted" style="margin-top:0">On-demand reports rendered client-side with jsPDF.</p>
           <div style="display:flex;flex-direction:column;gap:8px">
-            ${[["executive","Executive Summary","One-page RAG, SPI/CPI, forecast, top risks"],
+            ${[["buildsummary","Build Summary","Every tail at a glance \u2014 planned vs actual hours, variance, and build progress"],
+               ["executive","Executive Summary","One-page RAG, SPI/CPI, forecast, top risks"],
                ["weekly","Weekly Production","Status, tasks done/delayed, utilization, bottleneck"],
                ["resource","Resource Utilization","Labor & equipment loading and headroom"],
                ["capacity","Capacity Report","Peak loading, overloads, recommendations"],
                ["aircraft","Aircraft Status","Per-tail completion, stage, gate status"],
-               ["efficiency","Efficiency & Learning Curve","Required vs achieved efficiency, serial-build learning curve"],
+               ["efficiency","Learning Curve","Actual hours coming down to the planned target, per station and per tail"],
                ["progress","Progress & Actuals","Per stage/task: planned vs actual hours, crew that worked, % done, schedule variance"]
               ].map(([k,t,d])=>`<button class="btn" style="justify-content:flex-start;text-align:left;padding:10px 12px" data-act="export-pdf" data-kind="${k}">
                 ${icon("pdf","ico")}<span><b>${t}</b><br><span class="muted" style="font-weight:400;font-size:11px">${d}</span></span></button>`).join("")}
             <button class="btn" style="justify-content:flex-start;text-align:left;padding:10px 12px" data-act="fleet-report">
-              ${icon("flag","ico")}<span><b>Fleet Status (all / selected / by model)</b><br><span class="muted" style="font-weight:400;font-size:11px">Cross-program tail status: current station, % complete, schedule variance, RAG \u00b7 PDF &amp; CSV</span></span></button>
+              ${icon("flag","ico")}<span><b>Build Status (all / selected / by model)</b><br><span class="muted" style="font-weight:400;font-size:11px">Cross-program tail status: current station, % complete, schedule variance, RAG \u00b7 PDF &amp; CSV</span></span></button>
           </div>
         </div></div>
     </div>`;
@@ -2831,6 +2912,11 @@ function viewSettings(){
               </div>
               <div class="minihint">PNG / SVG / JPG. Appears in the header and on PDF reports. Without an image the 3-letter monogram is used.</div>
             </div>
+          </div>
+          <div class="frow">
+            <div class="field"><label>Product name</label><input data-set="appName" value="${esc(s.appName||'')}" placeholder="CompositePlan Pro">
+              <div class="hint">Shown in the header and on exports \u2014 rename it for your industry (yacht, e-foil, jetski, sculpture\u2026).</div></div>
+            <div class="field"><label>Header tagline</label><input data-set="appTagline" value="${esc(s.appTagline||'')}" placeholder="COMPOSITE MANUFACTURING \u00b7 MES"></div>
           </div>
           <div class="frow">
             <div class="field"><label>Company / report header</label><input data-set="companyName" value="${esc(s.companyName)}" placeholder="e.g. Falcon Aerospace Ltd">
@@ -2950,7 +3036,7 @@ function dateToMs(v, fallback){ if(!v) return fallback==null?null:fallback;
   const d=new Date(v+"T08:00:00"); return isNaN(d.getTime())? (fallback==null?null:fallback) : d.getTime(); }
 function isoStamp(){ return new Date().toISOString().slice(0,10); }
 
-function applyTheme(){ const ids=THEMES.map(t=>t.id); document.documentElement.dataset.theme = ids.includes(State.settings.theme)?State.settings.theme:"dark"; }
+function applyTheme(){ const ids=THEMES.map(t=>t.id); document.documentElement.dataset.theme = ids.includes(State.settings.theme)?State.settings.theme:"dark"; try{document.title=(State.settings.appName||"CompositePlan Pro");}catch(e){} }
 function commit(){ persist(); render(); }
 
 /* ================================================================== */
@@ -3478,8 +3564,10 @@ function saveSettings(){
   const get=k=>{ const el=document.querySelector(`[data-set="${k}"]`); return el?el.value:null; };
   const s=State.settings;
   s.userLabel = (get("userLabel")||s.userLabel).trim()||"Planner";
-  s.companyName = (get("companyName")||s.companyName).trim()||"AeroPlan Pro";
-  s.logoText = (get("logoText")||s.logoText).trim().slice(0,3)||"APP";
+  s.companyName = (get("companyName")||s.companyName).trim()||(State.settings.appName||"CompositePlan Pro");
+  s.logoText = (get("logoText")||s.logoText).trim().slice(0,3)||"CP";
+  s.appName = (get("appName")||s.appName||"").trim()||"CompositePlan Pro";
+  s.appTagline = (get("appTagline")!=null?get("appTagline"):s.appTagline||"").trim();
   const hpd=parseInt(get("hoursPerDay"),10); s.hoursPerDay = clamp(isNaN(hpd)?8:hpd,1,24);
   const th=get("theme"); if(th) s.theme=th;
   const ps=get("projectStart"); if(ps){ const d=new Date(ps+"T00:00:00"); if(!isNaN(d)) s.projectStartMs=d.getTime(); }
@@ -3636,7 +3724,7 @@ postRender.efficiency=function(){ const ap=activeProgram(); if(!ap) return; cons
 
 function reportScopeModal(kind){
   const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
-  const titleMap={executive:"Executive Summary",weekly:"Weekly Production",resource:"Resource Utilization",capacity:"Capacity Report",aircraft:"Aircraft Status",efficiency:"Efficiency & Learning Curve",progress:"Progress & Actuals"};
+  const titleMap={executive:"Executive Summary",weekly:"Weekly Production",resource:"Resource Utilization",capacity:"Capacity Report",aircraft:"Aircraft Status",efficiency:"Learning Curve",buildsummary:"Build Summary",progress:"Progress & Actuals"};
   const models=[...new Set(State.aircraft.map(a=>a.model).filter(Boolean))].sort();
   openModal((titleMap[kind]||"Report")+" \u2014 choose scope", `
     <div class="field"><label>Generate report for</label>
@@ -3659,7 +3747,7 @@ function fleetReportModal(){
   const progs=State.programs; if(!progs.length){ toast("No programs yet","warn"); return; }
   const ap=activeProgram();
   const models=[...new Set(State.aircraft.map(a=>a.model).filter(Boolean))].sort();
-  openModal("Status report", `
+  openModal("Build status report", `
     <div class="field"><label>Generate report for</label>
       <select id="fr_scope">
         <option value="program">This program${ap?" \u2014 "+esc(ap.name):""}</option>
@@ -3698,7 +3786,7 @@ function fleetReportCSV(){
       st.released?"Released":(st.behind?"Behind":(st.started?"In build":"Not started")),
       a.plannedFinishMs?fmtDate(a.plannedFinishMs):"", st.finMs?fmtDate(st.finMs):"", varDays]); });
   const csv=rows.map(r=>r.map(c=>{ c=String(c==null?"":c); return /[",\n]/.test(c)?'"'+c.replace(/"/g,'""')+'"':c; }).join(",")).join("\r\n");
-  triggerDownload("fleet-status-"+isoStamp()+".csv", csv, "text/csv;charset=utf-8"); toast("Fleet status CSV exported");
+  triggerDownload("build-status-"+isoStamp()+".csv", csv, "text/csv;charset=utf-8"); toast("Build status CSV exported");
 }
 function exportFleetPDF(){
   let scope=(document.getElementById("fr_scope")||{}).value||"program";
@@ -3714,14 +3802,14 @@ function exportFleetPDF(){
   const scopeName= scope==="all"?"All programs":(activeProgram()?activeProgram().name:"Program");
   const sub= scopeName+(model?"  \u00b7  Model: "+model:"  \u00b7  All models");
   function ensure(h){ if(y+h>H-40){ doc.addPage(); y=52; pageNum(); } }
-  let pages=1; function pageNum(){ doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub); doc.text((State.settings.companyName||"AeroPlan Pro")+"  \u00b7  Fleet Status", M, H-22); }
+  let pages=1; function pageNum(){ doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub); doc.text((State.settings.companyName||(State.settings.appName||"CompositePlan Pro"))+"  \u00b7  Build Status", M, H-22); }
   function header(){ doc.setFillColor(10,14,20); doc.rect(0,0,W,68,"F"); doc.setFillColor(56,189,248); doc.rect(0,68,W,3,"F");
     let tx=M; const lg=State.settings.logoDataUrl;
     if(lg){ try{ const fmt=/png/i.test(lg)?"PNG":/webp/i.test(lg)?"WEBP":"JPEG"; doc.addImage(lg,fmt,M,14,40,40); tx=M+50; }catch(_){ } }
     if(!lg){ doc.setTextColor(56,189,248); doc.setFont("helvetica","bold"); doc.setFontSize(9); doc.text((State.settings.logoText||"APP").toUpperCase(),tx,30); }
-    doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(15); doc.text("Fleet Status Report", tx, 50);
+    doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(15); doc.text("Build Status Report", tx, 50);
     doc.setFont("helvetica","normal"); doc.setFontSize(8); doc.setTextColor(150,170,190);
-    doc.text((State.settings.companyName||"AeroPlan Pro"), W-M, 26, {align:"right"});
+    doc.text((State.settings.companyName||(State.settings.appName||"CompositePlan Pro")), W-M, 26, {align:"right"});
     doc.text("Prepared by "+(State.settings.userLabel||"Planner"), W-M, 38, {align:"right"});
     doc.text("Generated "+new Date().toLocaleString(), W-M, 50, {align:"right"});
     doc.setFillColor(244,247,250); doc.rect(0,71,W,30,"F"); doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(sub,M,90);
@@ -3826,7 +3914,7 @@ function exportFleetPDF(){
         if(ci===4) return cell==="Released"?C.green:(cell==="Behind"?C.red:(cell==="In build"?BLUE:C.sub));
         if(ci===6 && /\+/.test(cell)) return C.red; return null; });
   });
-  doc.save(("fleet-status-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_")); toast("Fleet status report exported");
+  doc.save(("build-status-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_")); toast("Build status report exported");
 }
 
 function exportPDF(kind, scopeOpt){
@@ -3835,7 +3923,7 @@ function exportPDF(kind, scopeOpt){
   const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
   const M=44; let y=0;
   const W=doc.internal.pageSize.getWidth(), H=doc.internal.pageSize.getHeight(), CW=W-2*M;
-  const titleMap={executive:"Executive Summary",weekly:"Weekly Production Report",resource:"Resource Utilization Report",capacity:"Capacity Planning Report",aircraft:"Aircraft Status Report",efficiency:"Efficiency & Learning Curve Report",progress:"Progress & Actuals Report"};
+  const titleMap={executive:"Executive Summary",weekly:"Weekly Production Report",resource:"Resource Utilization Report",capacity:"Capacity Planning Report",aircraft:"Aircraft Status Report",efficiency:"Learning Curve Report",buildsummary:"Build Summary",progress:"Progress & Actuals Report"};
   const C={ink:[28,38,52],sub:[110,125,140],line:[223,229,236],green:[22,140,70],amber:[193,130,10],red:[206,42,42],blue:[37,99,235],grey:[120,130,140],head:[233,239,245],zebra:[247,249,251]};
   const spiCol=v=> v<0.9?C.red : v<0.99?C.amber : C.green;
   const pctCol=v=> v>100?C.red : v>=85?C.amber : v>=60?C.green : C.blue;
@@ -3850,14 +3938,16 @@ function exportPDF(kind, scopeOpt){
     doc.setTextColor(56,189,248); doc.setFont("helvetica","bold"); doc.setFontSize(9);
     if(!lg) doc.text((State.settings.logoText||"APP").toUpperCase(),tx,30);
     doc.setTextColor(255,255,255); doc.setFontSize(15);
-    doc.text(titleMap[kind]||"Report", tx, 50);
+    doc.text(titleMap[kind]||"Report", tx, 46);
+    doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor(125,205,248);
+    doc.text(scopeLabel, tx, 61);
     doc.setFont("helvetica","normal"); doc.setFontSize(8); doc.setTextColor(150,170,190);
-    doc.text((State.settings.companyName||"AeroPlan Pro"), W-M, 26, {align:"right"});
+    doc.text((State.settings.companyName||(State.settings.appName||"CompositePlan Pro")), W-M, 26, {align:"right"});
     doc.text("Prepared by "+(State.settings.userLabel||"Planner"), W-M, 38, {align:"right"});
     doc.text("Generated "+new Date().toLocaleString(), W-M, 50, {align:"right"});
     // program meta band
     doc.setFillColor(244,247,250); doc.rect(0,71,W,30,"F");
-    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(scopeLabel||ap.name,M,90);
+    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,C.ink); doc.text(ap.name,M,90);
     doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.sub);
     doc.text((ap.code||"")+"   \u00b7   "+acs.length+" aircraft   \u00b7   "+allTasks.length+" tasks", W-M, 90, {align:"right"});
     y=120;
@@ -4119,7 +4209,7 @@ function exportPDF(kind, scopeOpt){
     }
 
   } else if(kind==="aircraft"){
-    section("Fleet Completion");
+    section("Build Completion");
     table(["Tail","Model","Rev","Current stage","Complete","Status"],[80,80,45,CW-415,70,140],
       acs.map(a=>[a.serialNumber,a.model,a.buildRevision,currentStage(a.id),aircraftCompletion(a.id)+"%",prettyStatus(a.status)]),
       {align:["l","l","l","l","r","l"],cell:(r,c,v)=> c===4?pctCol(parseFloat(v)):null});
@@ -4145,45 +4235,147 @@ function exportPDF(kind, scopeOpt){
         {align:["l","l","l","l","l"],cell:(r,c,v)=> c===2? (v==="APPROVED"?C.green:v==="REJECTED"?C.red:C.amber):null});
     });
   } else if(kind==="efficiency"){
-    const lc=Analytics.learningCurve(ap.id); const ef=lc.eff; const acv=ef.progAchieved, rav=ef.progRequired;
+    // LEARNING CURVE = actual labour coming DOWN toward the planned target (the goal/floor), per station and overall.
+    const wOfp=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
+    const units = acs.slice().sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
+    const U = units.map((a,idx)=>{
+      const stps=State.stages.filter(s=>s.aircraftId===a.id).sort((p,q)=>p.sequence-q.sequence);
+      const rows=stps.map(s=>{ const tk=State.tasks.filter(t=>t.stageId===s.id);
+        const plan=sum(tk,t=>t.plannedLaborHours||0), act=sum(tk,t=>t.actualLaborHours||0);
+        const sw=sum(tk,wOfp); const pct= sw? round(sum(tk,t=>wOfp(t)*(t.percentComplete||0))/sw,0):0;
+        return {seq:s.sequence, name:s.name, plan, act, pct, started:(act>0||pct>0)}; });
+      const plan=sum(rows,r=>r.plan), act=sum(rows,r=>r.act);
+      return {a, n:idx+1, serial:a.serialNumber, model:a.model, rows, plan, act, pct:aircraftCompletion(a.id)}; });
+    const built=U.filter(u=>u.act>0); const doneU=built.filter(u=>u.pct>=100);
+    const totPlan=sum(U,u=>u.plan), totAct=sum(U,u=>u.act);
+    const overPct= totPlan? Math.round((totAct-totPlan)/totPlan*100):0;
+    let m4={label:"Latest tail vs target", value:"\u2014", sub:"need a completed tail", color:C.grey};
+    if(doneU.length){ const l=doneU[doneU.length-1]; const lo= l.plan? Math.round((l.act-l.plan)/l.plan*100):0;
+      const sub= doneU.length>=2? ("first tail was +"+(doneU[0].plan?Math.round((doneU[0].act-doneU[0].plan)/doneU[0].plan*100):0)+"%"):"vs its planned target";
+      m4={label:"Latest tail vs target", value:(lo>=0?"+":"")+lo+"%", sub, color: lo<=2?C.green:(lo<=25?C.amber:C.red)}; }
     metricBand([
-      {label:"Achieved Eff.",value: acv==null?"\u2014":acv+"%", sub:"earned \u00f7 actual", color: acv==null?C.grey:(rav!=null&&acv<rav?C.red:acv>=100?C.green:C.amber)},
-      {label:"Required Eff.",value: rav==null?"\u2014":rav+"%", sub:"fit build to window", color:C.blue},
-      {label:"Learning Rate",value: lc.enough?lc.LR+"%":"\u2014", sub: lc.enough?lc.slopePct+"% per doubling":"need 2+ units", color:C.ink},
-      {label:"Units (actuals)",value: ef.built+" / "+ef.units.length, sub:"serial builds", color:C.ink}
+      {label:"Planned target", value:Math.round(totPlan)+" h", sub:"the goal \u2014 reach this or less", color:C.blue},
+      {label:"Actual so far", value:Math.round(totAct)+" h", sub:"logged to date", color:C.ink},
+      {label:"Over target", value:(overPct>=0?"+":"")+overPct+"%", sub:Math.round(totAct-totPlan)+" h above target", color: overPct<=2?C.green:(overPct<=25?C.amber:C.red)},
+      m4
     ]);
-    section("Per-Unit Efficiency","standard vs actual labor hours");
-    table(["Unit","Serial","Std h","Act h","Earned","%","Req %","Ach %","On plan","Status"],
-      [38, CW-436, 46,46,50,34,46,46,60,70],
-      ef.units.map(u=>["U"+u.unit,u.serial,u.std,(u.act||"\u2014"),u.earned,u.pct+"%",(u.requiredEff==null?"\u2014":u.requiredEff+"%"),(u.achievedEff==null?"\u2014":u.achievedEff+"%"),
-        (u.onPlan==null?"\u2014":(u.onPlan?"On plan":("Late "+u.overrunDays+"d"))),
-        (u.complete?"Complete":(u.act>0?"In build":"Not started"))]),
-      {align:["l","l","r","r","r","r","r","r","l","l"], cell:(r,c)=>{ const u=ef.units[r]; if(!u) return null;
-        if(c===7){ if(u.achievedEff==null) return C.grey; if(u.requiredEff!=null&&u.achievedEff<u.requiredEff) return C.red; return u.achievedEff>=100?C.green:C.amber; }
-        if(c===8){ if(u.onPlan==null) return C.grey; return u.onPlan?C.green:C.red; } return null; }});
-    if(lc.enough){
-      section("Learning Curve","Wright model  \u00b7  LR "+lc.LR+"%  \u00b7  R2 "+lc.r2);
-      ensure(196); const px=M, pw=CW, ph=172, py=y;
-      const maxN=lc.obsMax+5; const maxV=Math.max.apply(null,[lc.T1].concat(lc.curve.map(c=>c.hrs)).concat(lc.points.map(p=>p.hrs)))*1.08;
-      const plotL=px+46, plotR=px+pw-14, plotT=py+8, plotB=py+ph-20, plotW=plotR-plotL, plotH=plotB-plotT;
-      doc.setDrawColor.apply(doc,C.line); doc.rect(px,py,pw,ph);
-      doc.setFontSize(7); doc.setTextColor.apply(doc,C.sub);
-      for(let g=0;g<=4;g++){ const yy=plotT+plotH*g/4; doc.setDrawColor(238,242,246); doc.line(plotL,yy,plotR,yy); doc.text(String(Math.round(maxV*(1-g/4))),px+42,yy+3,{align:"right"}); }
-      const X=k=> plotL + (maxN>1?(k-1)/(maxN-1):0)*plotW; const Y=v=> plotT+plotH*(1-v/maxV);
-      for(let k=1;k<=maxN;k++){ if(maxN>14&&k%2===0) continue; doc.text("U"+k, X(k), plotB+12, {align:"center"}); }
-      doc.setLineWidth(1.6); let prev=null;
-      lc.curve.forEach(c=>{ const cx=X(c.n),cy=Y(c.hrs); if(prev){ if(c.n<=lc.obsMax) doc.setDrawColor(37,99,235); else doc.setDrawColor(193,130,10); doc.line(prev[0],prev[1],cx,cy); } prev=[cx,cy]; });
-      doc.setLineWidth(1);
-      lc.points.forEach(p=>{ const cx=X(p.n),cy=Y(p.hrs); doc.setFillColor.apply(doc, p.complete?C.green:C.blue); doc.circle(cx,cy,2.6,"F"); });
-      y=py+ph+14;
-      table(["Projected unit","Estimated labor (h)"],[CW-170,170], lc.proj.map(p=>["U"+p.n,p.hrs]),{align:["l","r"]});
+    if(doneU.length>=2){ const f=doneU[0], l=doneU[doneU.length-1];
+      const fo= f.plan?(f.act-f.plan)/f.plan:0, lo2= l.plan?(l.act-l.plan)/l.plan:0; const closed=Math.round((fo-lo2)*100);
+      paragraph("The goal is to drive actual labour down to the planned target. The first completed tail ran "+Math.round(fo*100)+"% over target; the latest ran "+Math.round(lo2*100)+"% over \u2014 "+(closed>2?("the gap has closed by "+closed+" points as the team learns the build."):(closed< -2?"the gap has widened; review the stations still running hot below.":"the gap is holding steady.")));}
+    else { paragraph("The planned hours are the target (the goal to reach or beat). As you log actual hours across successive tails, this report shows each station's actual labour coming down toward its target."); }
+
+    // ---- vector line-chart helper ----
+    function lineChart(series, opts){
+      const labels=opts.labels||[]; const h=opts.h||150; ensure(h+34);
+      const px=M, pw=CW, py=y;
+      const plotL=px+46, plotR=px+pw-14, plotT=py+12, plotB=py+h-22, plotW=plotR-plotL, plotH=plotB-plotT;
+      const vals=[]; series.forEach(sr=>sr.pts.forEach(v=>{ if(v!=null&&isFinite(v)) vals.push(v); }));
+      const maxV=Math.max(1, ...vals)*1.14;
+      doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(1); doc.rect(px,py,pw,h);
+      doc.setFont("helvetica","normal"); doc.setFontSize(7); doc.setTextColor.apply(doc,C.sub);
+      for(let g=0;g<=4;g++){ const yy=plotT+plotH*g/4; doc.setDrawColor(236,240,244); doc.line(plotL,yy,plotR,yy); doc.text(String(Math.round(maxV*(1-g/4))),px+42,yy+2.4,{align:"right"}); }
+      const n=labels.length; const X=i=> n>1? plotL+(i/(n-1))*plotW : (plotL+plotW/2); const Y=v=> plotT+plotH*(1-v/maxV);
+      doc.setTextColor.apply(doc,C.sub); labels.forEach((lb,i)=>{ if(n>12&&i%2===1) return; doc.text(String(lb),X(i),plotB+11,{align:"center"}); });
+      series.forEach(sr=>{ const col=sr.color||C.blue;
+        if(!sr.dotsOnly){ doc.setDrawColor.apply(doc,col); doc.setLineWidth(sr.dashed?1:1.7);
+          if(sr.dashed&&doc.setLineDashPattern) doc.setLineDashPattern([3,2],0);
+          let prev=null; sr.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)){ prev=null; return; } const cx=X(i),cy=Y(v); if(prev) doc.line(prev[0],prev[1],cx,cy); prev=[cx,cy]; });
+          if(sr.dashed&&doc.setLineDashPattern) doc.setLineDashPattern([],0); doc.setLineWidth(1); }
+        sr.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)) return; const cx=X(i),cy=Y(v); doc.setFillColor.apply(doc,col); doc.circle(cx,cy,2.3,"F"); });
+      });
+      y=py+h+4; let lx=px+2; doc.setFontSize(7.5);
+      series.forEach(sr=>{ doc.setFillColor.apply(doc,sr.color||C.blue); doc.rect(lx,y-3.5,8,4,"F"); doc.setTextColor.apply(doc,C.sub); doc.text(sr.name,lx+11,y); lx+=11+doc.getTextWidth(sr.name)+16; });
+      y+=14;
     }
-    section("Analysis & Recommendations");
-    let an;
-    if(lc.enough){ const trend= lc.LR<90?"a strong learning effect":lc.LR<98?"a moderate learning effect":"little measurable learning yet"; const behind=(acv!=null&&rav!=null&&acv<rav);
-      an="Across "+lc.points.length+" built unit(s), first-unit labor fits at ~"+lc.T1+" h with "+trend+" \u2014 a "+lc.LR+"% learning rate (each doubling of cumulative units cuts unit hours by ~"+lc.slopePct+"%), R\u00b2 "+lc.r2+". "+(lc.proj.length?"The next unit (U"+(lc.obsMax+1)+") is projected at ~"+lc.proj[0].hrs+" h. ":"")+"Fleet achieved efficiency is "+(acv==null?"n/a":acv+"%")+" against a required "+(rav==null?"n/a":rav+"%")+(behind?" \u2014 currently behind the rate needed to hold the planned windows; add crew, authorise overtime, or widen the window.":" \u2014 on or ahead of the rate needed to hold the planned windows.");
-    } else an="Record actual labor hours and % complete on each task for at least two serially-built tails to fit a learning curve. Achieved efficiency = earned \u00f7 actual labor; required efficiency = standard hours \u00f7 the labor capacity available inside each aircraft's planned window.";
-    paragraph(an);
+    // ---- small per-station learning curve ----
+    function miniCurve(bx,by,bw,bh,name,target,ser,labels){
+      doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(0.8); doc.rect(bx,by,bw,bh);
+      doc.setFont("helvetica","bold"); doc.setFontSize(7.4); doc.setTextColor.apply(doc,C.ink);
+      doc.text(name.length>34?name.slice(0,33)+"\u2026":name, bx+6, by+11);
+      doc.setFont("helvetica","normal"); doc.setFontSize(6.6); doc.setTextColor.apply(doc,C.sub);
+      doc.text("target "+Math.round(target)+"h", bx+6, by+20);
+      const plotL=bx+24, plotR=bx+bw-8, plotT=by+24, plotB=by+bh-12, plotW=plotR-plotL, plotH=plotB-plotT;
+      const vals=ser.map(p=>p.act).filter(v=>v!=null&&isFinite(v)); const maxV=Math.max(target, ...vals, 1)*1.18;
+      const n=labels.length; const X=i=> n>1? plotL+(i/(n-1))*plotW : plotL+plotW/2; const Y=v=> plotT+plotH*(1-v/maxV);
+      doc.setDrawColor(150,158,168); doc.setLineWidth(0.8); if(doc.setLineDashPattern) doc.setLineDashPattern([2,2],0);
+      doc.line(plotL,Y(target),plotR,Y(target)); if(doc.setLineDashPattern) doc.setLineDashPattern([],0);
+      doc.setDrawColor.apply(doc,C.blue); doc.setLineWidth(1.3); let prev=null;
+      ser.forEach((p,i)=>{ if(p.act==null||!isFinite(p.act)){ prev=null; return; } const cx=X(i),cy=Y(p.act); if(prev) doc.line(prev[0],prev[1],cx,cy); prev=[cx,cy]; });
+      doc.setLineWidth(1);
+      ser.forEach((p,i)=>{ if(p.act==null||!isFinite(p.act)) return; const cx=X(i),cy=Y(p.act); const over=p.act>target*1.02; doc.setFillColor.apply(doc, !p.done?C.amber:(over?C.red:C.green)); doc.circle(cx,cy,1.8,"F"); });
+      doc.setFontSize(5.8); doc.setTextColor.apply(doc,C.sub);
+      labels.forEach((lb,i)=>{ if(n>6 && i%2===1) return; doc.text(String(lb),X(i),plotB+8,{align:"center"}); });
+    }
+
+    // station data across units
+    const ref=U.reduce((a,b)=> (b.rows.length>a.rows.length?b:a), U[0]||{rows:[]});
+    const stationData=(ref.rows||[]).map(rr=>{ const nm=rr.name;
+      return { name:nm, target: rr.plan||0, ser: U.map(u=>{ const r=u.rows.find(x=>x.name===nm); return { act: r&&r.act>0? r.act:null, done: r? r.pct>=100:false }; }) }; });
+    const ulabels=U.map(u=>"U"+u.n);
+
+    // 1) Overall learning curve \u2014 total actual per tail dropping to the planned target
+    section("Overall learning curve","each tail's total labour coming down to the planned target (dashed)");
+    { const target=U.map(u=>Math.round(u.plan));
+      const doneLine=U.map(u=>(u.act>0&&u.pct>=100)?Math.round(u.act):null);
+      const inProg=U.map(u=>(u.act>0&&u.pct<100)?Math.round(u.act):null);
+      const series=[{name:"Planned target",color:[150,158,168],dashed:true,pts:target},{name:"Actual (completed)",color:C.green,pts:doneLine}];
+      if(inProg.some(v=>v!=null)) series.push({name:"Actual so far (in build)",color:C.amber,dotsOnly:true,pts:inProg});
+      lineChart(series,{labels:ulabels,h:150}); ensure(11);
+      doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub);
+      doc.text("Dashed line = planned target. The aim is to bring each tail's actual hours down to it or below.", M, y); y+=14; }
+
+    // 2) Per-station learning curves (small multiples) \u2014 the core: each station driven to its target
+    const withAct=stationData.filter(sd=>sd.ser.some(p=>p.act!=null));
+    if(withAct.length){
+      section("Each station's learning curve","actual per tail (dots) vs planned target (dashed)");
+      const bw=(CW-10)/2, bh=92;
+      for(let i=0;i<withAct.length;i+=2){ ensure(bh+8);
+        miniCurve(M,y,bw,bh,withAct[i].name,withAct[i].target,withAct[i].ser,ulabels);
+        if(withAct[i+1]) miniCurve(M+bw+10,y,bw,bh,withAct[i+1].name,withAct[i+1].target,withAct[i+1].ser,ulabels);
+        y+=bh+8; }
+    }
+
+    // 3) Gap-to-target table
+    if(stationData.length){
+      section("Gap to target by station","how far each station sits above its target, and whether the gap is closing");
+      table(["#","Station",">Target h",">First tail h",">Latest tail h",">Gap now",">Trend"],[26, CW-26-54-58-58-50-58, 54,58,58,50,58],
+        stationData.map((sd,i)=>{ const acts=sd.ser.map(p=>p.act); const firstA=acts.find(v=>v!=null); const lastA=[...acts].reverse().find(v=>v!=null);
+          const gNow=(lastA!=null&&sd.target>0)?Math.round((lastA-sd.target)/sd.target*100):null;
+          const gFirst=(firstA!=null&&sd.target>0)?Math.round((firstA-sd.target)/sd.target*100):null;
+          const trend=(gNow!=null&&gFirst!=null)?(gNow<gFirst-1?"Closing":(gNow>gFirst+1?"Widening":"Flat")):"\u2014";
+          return [i+1, sd.name, Math.round(sd.target), firstA!=null?Math.round(firstA):"\u2014", lastA!=null?Math.round(lastA):"\u2014", gNow!=null?((gNow>=0?"+":"")+gNow+"%"):"\u2014", trend]; }),
+        { align:["r","l","r","r","r","r","l"], cell:(ri,ci,cell)=>{ const sd=stationData[ri]; const acts=sd.ser.map(p=>p.act); const lastA=[...acts].reverse().find(v=>v!=null);
+          if(ci===5 && lastA!=null) return lastA>sd.target*1.02?C.red:C.green;
+          if(ci===6) return cell==="Closing"?C.green:(cell==="Widening"?C.red:C.sub); return null; } });
+    }
+    if(!built.length){ paragraph("No actual labour recorded yet \u2014 log actual hours on tasks and each station's learning curve toward its planned target will appear here."); }
+
+  } else if(kind==="buildsummary"){
+    // Simple one-line-per-tail overview: planned vs actual hours, variance %, and build progress.
+    const ord=acs.slice().sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
+    const rowsU=ord.map(a=>{ const sts=State.stages.filter(s=>s.aircraftId===a.id); const tk=State.tasks.filter(t=>sts.some(s=>s.id===t.stageId));
+      const plan=sum(tk,t=>t.plannedLaborHours||0), act=sum(tk,t=>t.actualLaborHours||0); const varPct= plan? Math.round((act-plan)/plan*100):0;
+      const st=acStatus(a.id); const station= st.released?"Delivered":(st.currentStation||"\u2014");
+      const status= st.released?"Delivered":((st.behind||st.delayed)?"Delayed":(st.started?"On track":"Not started"));
+      return {model:a.model, serial:a.serialNumber, plan, act, varPct, prog:st.overall, station, status}; });
+    const wOf=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
+    const totW=sum(allTasks,wOf); const overallProg= totW? Math.round(sum(allTasks,t=>wOf(t)*(t.percentComplete||0))/totW):0;
+    const totPlanAll=sum(rowsU,r=>r.plan), totActAll=sum(rowsU,r=>r.act);
+    metricBand([
+      {label:"Builds", value:String(acs.length), sub:"in scope", color:C.blue},
+      {label:"Planned hours", value:Math.round(totPlanAll)+" h", sub:"all builds", color:C.ink},
+      {label:"Actual hours", value:Math.round(totActAll)+" h", sub:"logged to date", color:C.ink},
+      {label:"Overall progress", value:overallProg+"%", sub:"of all builds", color: overallProg>=70?C.green:(overallProg>=30?C.amber:C.blue)}
+    ]);
+    section("Every build","planned vs actual hours, variance, and where each tail is");
+    const statW=Math.max(78, CW-(86+58+46+46+44+54+64));
+    table(["Model","Serial",">Plan h",">Act h",">Var %",">Progress","Station","Status"],
+      [86,58,46,46,44,54,statW,64],
+      rowsU.map(r=>[r.model||"\u2014", r.serial, Math.round(r.plan), Math.round(r.act), (r.varPct>=0?"+":"")+r.varPct+"%", r.prog+"%", r.station, r.status]),
+      { align:["l","l","r","r","r","r","l","l"], cell:(ri,ci)=>{ const r=rowsU[ri]; if(!r) return null;
+        if(ci===4) return r.varPct>2?C.red:(r.varPct< -2?C.green:C.sub);
+        if(ci===7) return r.status==="Delayed"?C.red:((r.status==="Delivered"||r.status==="On track")?C.green:C.sub); return null; } });
+    if(!rowsU.length) paragraph("No builds in scope.");
 
   } else if(kind==="progress"){
     const acs2=acs.slice().sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
@@ -4238,7 +4430,7 @@ function exportPDF(kind, scopeOpt){
   for(let i=1;i<=pages;i++){ doc.setPage(i);
     doc.setDrawColor.apply(doc,C.line); doc.line(M,H-32,W-M,H-32);
     doc.setFontSize(7.5); doc.setTextColor(150,160,175);
-    doc.text((State.settings.companyName||"AeroPlan Pro")+"  \u00b7  "+ap.name+"  \u00b7  Confidential",M,H-20);
+    doc.text((State.settings.companyName||(State.settings.appName||"CompositePlan Pro"))+"  \u00b7  "+ap.name+"  \u00b7  Confidential",M,H-20);
     doc.text("Page "+i+" of "+pages,W-M,H-20,{align:"right"}); }
   doc.save("aeroplan-"+kind+"-"+isoStamp()+".pdf");
   toast(titleMap[kind]+" exported");
@@ -4339,6 +4531,50 @@ function dupProgram(programId){ const p=byId(State.programs,programId); if(!p) r
 }
 function dupAircraft(acId){ const a=byId(State.aircraft,acId); if(!a) return; const na=cloneAircraftInto(a, a.programId);
   State.ui.activeAircraft=na.id; commit(); toast("Aircraft duplicated"); }
+/* ---------- Copy build WITH data + new dates (migration helper) ---------- */
+function cloneAircraftWithOpts(srcAc, opts){
+  opts=opts||{}; const na=cloneAircraftInto(srcAc, srcAc.programId);   // base clone (structure + planned hours; actuals reset)
+  if(opts.serial) na.serialNumber=opts.serial;
+  if(opts.model) na.model=opts.model;
+  if(opts.startMs!=null){ if(srcAc.plannedStartMs){ const delta=opts.startMs - srcAc.plannedStartMs; na.plannedStartMs=opts.startMs; if(srcAc.plannedFinishMs) na.plannedFinishMs=srcAc.plannedFinishMs+delta; }
+    else na.plannedStartMs=opts.startMs; }
+  if(opts.keepData){ const ss=State.stages.filter(s=>s.aircraftId===srcAc.id).sort((a,b)=>a.sequence-b.sequence);
+    const ds=State.stages.filter(s=>s.aircraftId===na.id).sort((a,b)=>a.sequence-b.sequence);
+    ss.forEach((s,si)=>{ const d=ds[si]; if(!d) return;
+      const st=State.tasks.filter(t=>t.stageId===s.id).sort((a,b)=>(a.seq||0)-(b.seq||0));
+      const dt=State.tasks.filter(t=>t.stageId===d.id).sort((a,b)=>(a.seq||0)-(b.seq||0));
+      st.forEach((t,ti)=>{ const x=dt[ti]; if(!x) return; x.actualLaborHours=t.actualLaborHours; x.actualCost=t.actualCost; x.percentComplete=t.percentComplete; x.status=t.status; }); }); }
+  return na;
+}
+function bumpSerial(base,i){ if(i<=0) return base; const m=String(base).match(/^(.*?)(\d+)([^\d]*)$/);
+  if(m){ const n=parseInt(m[2],10)+i; return m[1]+String(n).padStart(m[2].length,"0")+m[3]; } return base+"-"+(i+1); }
+function copyBuildModal(acId){ const a=byId(State.aircraft,acId); if(!a) return;
+  const start= a.plannedStartMs? new Date(a.plannedStartMs).toISOString().slice(0,10):"";
+  openModal("Copy build", `
+    <p class="muted" style="margin-top:0">Clones every stage, task, dependency and equipment need from <b>${esc(a.serialNumber)}</b>. Handy when migrating \u2014 copy a build and just change the dates.</p>
+    <div class="frow">
+      <div class="field"><label>New serial / tail number</label><input id="cb_serial" value="${esc(a.serialNumber)}-2"></div>
+      <div class="field"><label>Model</label><input id="cb_model" value="${esc(a.model||"")}"></div>
+    </div>
+    <div class="frow">
+      <div class="field"><label>Planned start date</label><input id="cb_start" type="date" value="${start}"></div>
+      <div class="field"><label>Number of copies</label><input id="cb_count" type="number" min="1" max="50" value="1"></div>
+    </div>
+    <label class="swrow" style="margin-top:10px"><input type="checkbox" id="cb_keep"> &nbsp;Copy actual hours &amp; progress too</label>
+    <div class="minihint">Leave unchecked for a fresh build (structure + planned hours only). Multiple copies auto-increment the serial number.</div>
+  `, `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="copy-build-go" data-id="${acId}">${icon("copy","ico")} Create</button>`);
+}
+function copyBuildGo(acId){ const a=byId(State.aircraft,acId); if(!a) return;
+  const g=id=>document.getElementById(id);
+  const serial=((g("cb_serial")||{}).value||"").trim()||a.serialNumber+"-2";
+  const model=((g("cb_model")||{}).value||"").trim();
+  const startStr=(g("cb_start")||{}).value; const startMs= startStr? Date.parse(startStr+"T00:00:00Z"):null;
+  const count=Math.max(1,Math.min(50,parseInt((g("cb_count")||{}).value||"1",10)||1));
+  const keep=!!((g("cb_keep")||{}).checked);
+  let last=null;
+  for(let i=0;i<count;i++){ last=cloneAircraftWithOpts(a,{serial:bumpSerial(serial,i), model:model||a.model, startMs, keepData:keep}); }
+  closeModal(); if(last) State.ui.activeAircraft=last.id;
+  commit(); toast(count>1? (count+" builds created from "+a.serialNumber+" \u2014 press Run Schedule") : ("Build copied \u2014 "+(last?last.serialNumber:serial)+" \u2014 press Run Schedule")); }
 function dupTask(taskId){ const t=byId(State.tasks,taskId); if(!t) return; const stage=byId(State.stages,t.stageId); if(!stage) return;
   const nt=JSON.parse(JSON.stringify(t)); nt.id=uid("task"); nt.name=t.name+" (copy)"; nt.status="NOT_STARTED"; nt.percentComplete=0; nt.actualLaborHours=0; nt.actualCost=0;
   nt.wbsCode=stage.sequence+"."+(stage.taskIds.length+1);
@@ -4501,6 +4737,8 @@ document.addEventListener("click", (e)=>{
     case "delete-program": deleteProgram(id); break;
     case "dup-program": dupProgram(id); break;
     case "dup-aircraft": dupAircraft(id); break;
+    case "copy-build": copyBuildModal(id); break;
+    case "copy-build-go": copyBuildGo(id); break;
     case "dup-task": dupTask(id); break;
     case "dup-labor": dupLabor(id); break;
     case "dup-equip": dupEquip(id); break;
@@ -4801,7 +5039,7 @@ function setupPWA(){
     const icon="data:image/svg+xml;utf8,"+encodeURIComponent(svg);
     [["icon"],["apple-touch-icon"]].forEach(([rel])=>{ let l=document.querySelector("link[rel='"+rel+"']"); if(!l){ l=document.createElement("link"); l.rel=rel; document.head.appendChild(l); } l.href=icon; });
     const here=(location.href||"").split("#")[0]; const scope=here.replace(/[^/]*$/,"");
-    const mani={ name:"AeroPlan Pro", short_name:"AeroPlan", description:"UAV manufacturing planning & MES", start_url:here||".", scope:scope||"./", display:"standalone", orientation:"any", background_color:"#0a0e14", theme_color:"#0a0e14",
+    const mani={ name:(State.settings.appName||"CompositePlan Pro"), short_name:(State.settings.appName||"CompositePlan Pro").split(" ")[0], description:"Composite manufacturing planning & MES", start_url:here||".", scope:scope||"./", display:"standalone", orientation:"any", background_color:"#0a0e14", theme_color:"#0a0e14",
       icons:[{src:icon,sizes:"512x512",type:"image/svg+xml",purpose:"any"},{src:icon,sizes:"192x192",type:"image/svg+xml",purpose:"maskable"}] };
     let ml=document.getElementById("manifest-link"); if(!ml){ ml=document.createElement("link"); ml.rel="manifest"; ml.id="manifest-link"; document.head.appendChild(ml); }
     try{ ml.href=URL.createObjectURL(new Blob([JSON.stringify(mani)],{type:"application/manifest+json"})); }
