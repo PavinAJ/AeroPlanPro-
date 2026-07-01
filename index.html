@@ -2227,12 +2227,14 @@ function viewDashboard(){
         <div class="panel-b">${(function(){ const LM=learningModel(acs); const U=LM.U; const built=U.filter(u=>u.act>0);
           if(!built.length) return `<div class="empty" style="padding:24px">${icon("chart","ico")}<h4>No actual hours yet</h4><p class="muted">Planned hours are the target. Log actual labour and each tail's total hours appear here, with the goal of driving them down to the target.</p></div>`;
           const labels=U.map(u=>u.serial);
-          const target=U.map(u=>Math.round(u.plan)), done=U.map(u=>(u.act>0&&u.pct>=100)?Math.round(u.act):null), ip=U.map(u=>(u.act>0&&u.pct<100)?Math.round(u.act):null);
-          const series=[{color:"var(--ink-3)",dashed:true,pts:target,dotR:0},{color:"var(--green)",pts:done}];
+          const target=U.map(u=>Math.round(u.plan));
+          const proj=U.map(u=>(u.act>0&&u.pct>0)?Math.round(u.act/(u.pct/100)):null);
+          const ip=U.map(u=>(u.act>0&&u.pct>0&&u.pct<100)?Math.round(u.act/(u.pct/100)):null);
+          const series=[{color:"var(--ink-3)",dashed:true,pts:target,dotR:0},{color:"var(--green)",pts:proj}];
           if(ip.some(v=>v!=null)) series.push({color:"var(--amber)",dotsOnly:true,pts:ip});
-          const doneU=built.filter(u=>u.pct>=100); let note="Dashed line = planned target; the goal is to bring each tail down to it.";
-          if(doneU.length>=2){ const f=doneU[0], l=doneU[doneU.length-1]; const fo=f.plan?Math.round((f.act-f.plan)/f.plan*100):0, lo=l.plan?Math.round((l.act-l.plan)/l.plan*100):0; note="First tail ran +"+fo+"% over target; latest ("+esc(l.serial)+") "+(lo>=0?"+":"")+lo+"% \u2014 "+(lo<fo?"closing on target.":"not closing yet."); }
-          return svgLine(520,210,labels,series,{maxX:8})+`<div class="lc-legend"><span><i style="background:var(--green)"></i>actual (done)</span><span><i style="background:var(--amber)"></i>in build</span><span><i style="background:var(--ink-3)"></i>target</span></div><div class="muted" style="font-size:11px;margin-top:4px">${note}</div>`; })()}</div>
+          const bp=built.filter(u=>u.pct>0); let note="Projected total hours at current pace (actual \u00f7 % complete) vs the dashed target \u2014 so tails at different completion compare fairly.";
+          if(bp.length>=2){ const f=bp[0], l=bp[bp.length-1]; const fp=f.act/(f.pct/100), lp=l.act/(l.pct/100); const fo=f.plan?Math.round((fp-f.plan)/f.plan*100):0, lo=l.plan?Math.round((lp-l.plan)/l.plan*100):0; note="Projected total at current pace vs target. First tail +"+fo+"%; latest ("+esc(l.serial)+") "+(lo>=0?"+":"")+lo+"% \u2014 "+(lo<fo?"trending down.":"not down yet."); }
+          return svgLine(520,210,labels,series,{maxX:8})+`<div class="lc-legend"><span><i style="background:var(--green)"></i>actual</span><span><i style="background:var(--amber)"></i>in build</span><span><i style="background:var(--ink-3)"></i>target</span></div><div class="muted" style="font-size:11px;margin-top:4px">${note}</div>`; })()}</div>
       </div>
     </div>
 
@@ -4246,23 +4248,25 @@ function exportPDF(kind, scopeOpt){
         return {seq:s.sequence, name:s.name, plan, act, pct, started:(act>0||pct>0)}; });
       const plan=sum(rows,r=>r.plan), act=sum(rows,r=>r.act);
       return {a, n:idx+1, serial:a.serialNumber, model:a.model, rows, plan, act, pct:aircraftCompletion(a.id)}; });
-    const built=U.filter(u=>u.act>0); const doneU=built.filter(u=>u.pct>=100);
+    const built=U.filter(u=>u.act>0); const bp=built.filter(u=>u.pct>0);
+    const projOf=(u)=> u.pct>0? u.act/(u.pct/100) : u.act;   // projected total at current pace
     const totPlan=sum(U,u=>u.plan), totAct=sum(U,u=>u.act);
-    const overPct= totPlan? Math.round((totAct-totPlan)/totPlan*100):0;
-    let m4={label:"Latest tail vs target", value:"\u2014", sub:"need a completed tail", color:C.grey};
-    if(doneU.length){ const l=doneU[doneU.length-1]; const lo= l.plan? Math.round((l.act-l.plan)/l.plan*100):0;
-      const sub= doneU.length>=2? ("first tail was +"+(doneU[0].plan?Math.round((doneU[0].act-doneU[0].plan)/doneU[0].plan*100):0)+"%"):"vs its planned target";
+    const totProj=sum(bp,projOf)+sum(U.filter(u=>!(u.act>0)),u=>u.plan);
+    const overPct= totPlan? Math.round((totProj-totPlan)/totPlan*100):0;
+    let m4={label:"Latest tail vs target", value:"\u2014", sub:"log actual hours", color:C.grey};
+    if(bp.length){ const l=bp[bp.length-1]; const lp=projOf(l); const lo= l.plan? Math.round((lp-l.plan)/l.plan*100):0;
+      const sub= bp.length>=2? ("first tail +"+(bp[0].plan?Math.round((projOf(bp[0])-bp[0].plan)/bp[0].plan*100):0)+"%"):"projected at current pace";
       m4={label:"Latest tail vs target", value:(lo>=0?"+":"")+lo+"%", sub, color: lo<=2?C.green:(lo<=25?C.amber:C.red)}; }
     metricBand([
       {label:"Planned target", value:Math.round(totPlan)+" h", sub:"the goal \u2014 reach this or less", color:C.blue},
       {label:"Actual so far", value:Math.round(totAct)+" h", sub:"logged to date", color:C.ink},
-      {label:"Over target", value:(overPct>=0?"+":"")+overPct+"%", sub:Math.round(totAct-totPlan)+" h above target", color: overPct<=2?C.green:(overPct<=25?C.amber:C.red)},
+      {label:"Projected vs target", value:(overPct>=0?"+":"")+overPct+"%", sub:"at current pace, full build", color: overPct<=2?C.green:(overPct<=25?C.amber:C.red)},
       m4
     ]);
-    if(doneU.length>=2){ const f=doneU[0], l=doneU[doneU.length-1];
-      const fo= f.plan?(f.act-f.plan)/f.plan:0, lo2= l.plan?(l.act-l.plan)/l.plan:0; const closed=Math.round((fo-lo2)*100);
-      paragraph("The goal is to drive actual labour down to the planned target. The first completed tail ran "+Math.round(fo*100)+"% over target; the latest ran "+Math.round(lo2*100)+"% over \u2014 "+(closed>2?("the gap has closed by "+closed+" points as the team learns the build."):(closed< -2?"the gap has widened; review the stations still running hot below.":"the gap is holding steady.")));}
-    else { paragraph("The planned hours are the target (the goal to reach or beat). As you log actual hours across successive tails, this report shows each station's actual labour coming down toward its target."); }
+    if(bp.length>=2){ const f=bp[0], l=bp[bp.length-1];
+      const fo=f.plan?(projOf(f)-f.plan)/f.plan:0, lo2=l.plan?(projOf(l)-l.plan)/l.plan:0; const closed=Math.round((fo-lo2)*100);
+      paragraph("Tails sit at different completion, so this compares each tail's PROJECTED total at its current pace (actual \u00f7 % complete) against the planned target. The first tail projects "+Math.round(fo*100)+"% over target; the latest "+Math.round(lo2*100)+"% \u2014 "+(closed>2?("trending down by "+closed+" points as the team learns the build."):(closed< -2?"trending up; review the stations running hot below.":"holding steady.")));}
+    else { paragraph("Planned hours are the target. Because tails sit at different completion, the curve compares each tail's projected total at its current pace (actual \u00f7 % complete) against the target \u2014 so a 30%-done tail and a 75%-done tail compare fairly."); }
 
     // ---- vector line-chart helper ----
     function lineChart(series, opts){
@@ -4281,7 +4285,7 @@ function exportPDF(kind, scopeOpt){
           if(sr.dashed&&doc.setLineDashPattern) doc.setLineDashPattern([3,2],0);
           let prev=null; sr.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)){ prev=null; return; } const cx=X(i),cy=Y(v); if(prev) doc.line(prev[0],prev[1],cx,cy); prev=[cx,cy]; });
           if(sr.dashed&&doc.setLineDashPattern) doc.setLineDashPattern([],0); doc.setLineWidth(1); }
-        sr.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)) return; const cx=X(i),cy=Y(v); doc.setFillColor.apply(doc,col); doc.circle(cx,cy,2.3,"F"); });
+        sr.pts.forEach((v,i)=>{ if(v==null||!isFinite(v)) return; const rr=(sr.dotR!=null?sr.dotR:2.3); if(rr<=0) return; const cx=X(i),cy=Y(v); doc.setFillColor.apply(doc,col); doc.circle(cx,cy,rr,"F"); });
       });
       y=py+h+4; let lx=px+2; doc.setFontSize(7.5);
       series.forEach(sr=>{ doc.setFillColor.apply(doc,sr.color||C.blue); doc.rect(lx,y-3.5,8,4,"F"); doc.setTextColor.apply(doc,C.sub); doc.text(sr.name,lx+11,y); lx+=11+doc.getTextWidth(sr.name)+16; });
@@ -4313,16 +4317,16 @@ function exportPDF(kind, scopeOpt){
       return { name:nm, target: rr.plan||0, ser: U.map(u=>{ const r=u.rows.find(x=>x.name===nm); return { act: r&&r.act>0? r.act:null, done: r? r.pct>=100:false }; }) }; });
     const ulabels=U.map(u=>"U"+u.n);
 
-    // 1) Overall learning curve \u2014 total actual per tail dropping to the planned target
-    section("Overall learning curve","each tail's total labour coming down to the planned target (dashed)");
+    // 1) Overall learning curve \u2014 projected total per tail (actual/%) vs planned target
+    section("Overall learning curve","projected total labour per tail at current pace vs the planned target (dashed)");
     { const target=U.map(u=>Math.round(u.plan));
-      const doneLine=U.map(u=>(u.act>0&&u.pct>=100)?Math.round(u.act):null);
-      const inProg=U.map(u=>(u.act>0&&u.pct<100)?Math.round(u.act):null);
-      const series=[{name:"Planned target",color:[150,158,168],dashed:true,pts:target},{name:"Actual (completed)",color:C.green,pts:doneLine}];
-      if(inProg.some(v=>v!=null)) series.push({name:"Actual so far (in build)",color:C.amber,dotsOnly:true,pts:inProg});
+      const proj=U.map(u=>(u.act>0&&u.pct>0)?Math.round(u.act/(u.pct/100)):null);
+      const inProg=U.map(u=>(u.act>0&&u.pct>0&&u.pct<100)?Math.round(u.act/(u.pct/100)):null);
+      const series=[{name:"Planned target",color:[150,158,168],dashed:true,dotR:0,pts:target},{name:"Projected total",color:C.green,pts:proj}];
+      if(inProg.some(v=>v!=null)) series.push({name:"In build",color:C.amber,dotsOnly:true,pts:inProg});
       lineChart(series,{labels:ulabels,h:150}); ensure(11);
       doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.sub);
-      doc.text("Dashed line = planned target. The aim is to bring each tail's actual hours down to it or below.", M, y); y+=14; }
+      doc.text("Green line = projected total hours (actual \u00f7 % complete); amber = in build; dashed = target. Normalising by % lets tails at different completion compare fairly.", M, y); y+=14; }
 
     // 2) Per-station learning curves (small multiples) \u2014 the core: each station driven to its target
     const withAct=stationData.filter(sd=>sd.ser.some(p=>p.act!=null));
