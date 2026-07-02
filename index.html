@@ -2332,6 +2332,8 @@ function viewAircraft(){
         <button class="btn sm" data-act="edit-aircraft" data-id="${a.id}">${icon("edit","ico")}</button>
         <button class="btn sm" data-act="dup-aircraft" data-id="${a.id}" title="Duplicate aircraft">${icon("copy","ico")}</button>
         <button class="btn sm" data-act="copy-build" data-id="${a.id}" title="Copy build with data &amp; new dates">${icon("copy","ico")} Copy</button>
+        <button class="btn sm" data-act="tracker-board" data-id="${a.id}" title="Print large-format ops board for manual tracking">${icon("print","ico")} Ops board</button>
+        <button class="btn sm" data-act="gantt-board" data-id="${a.id}" title="Print a Gantt chart for this build (A4 / A3 / 36in roll)">${icon("printer","ico")} Gantt</button>
         <button class="btn sm danger" data-act="delete-aircraft" data-id="${a.id}">${icon("trash","ico")}</button></div>
       <div class="panel-b">
         <div class="kv">
@@ -3919,6 +3921,378 @@ function exportFleetPDF(){
   doc.save(("build-status-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_")); toast("Build status report exported");
 }
 
+/* ============================================================================
+   PROTOTYPE OPS BOARD  —  large-format (plotter roll) manual tracking board.
+   For first-article builds: technicians fill it in BY HAND (tick phases, write
+   actual hours / crew / dates / initials, QA sign-off). Printed row IDs (WBS)
+   and a Build ID let the handwritten data be keyed back into the system later.
+   Sized for a plotter roll: the roll width (24/36/42") is the fixed dimension;
+   the sheet grows in length with the number of tasks (one continuous sheet).
+   ==========================================================================*/
+function trackerBoardModal(acId){
+  const a=byId(State.aircraft, acId); if(!a){ toast("Open an aircraft first","warn"); return; }
+  const ap=byId(State.programs, a.programId);
+  openModal("Print ops board", `
+    <p class="muted" style="margin-top:0">Large-format tracking board for <b>${esc(a.serialNumber)}</b>${ap?(" \u00b7 "+esc(ap.name)):""}. Print it on the plotter, track the build by hand, then key the numbers back in \u2014 the printed IDs make re-entry quick.</p>
+    <div class="frow">
+      <div class="field"><label>Roll width</label><select id="ob_w"><option value="36" selected>36 inch</option><option value="24">24 inch</option><option value="42">42 inch</option></select></div>
+      <div class="field"><label>Contents</label><select id="ob_mode"><option value="blank" selected>Blank \u2014 write-in (first article)</option><option value="prefill">Pre-filled with current data</option></select></div>
+    </div>
+    <div class="minihint">Produces one continuous sheet: the roll width across, as long as the task list needs. Send to the plotter at 100% (turn OFF "fit to page").</div>
+  `, `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="tracker-board-go" data-id="${acId}">${icon("print","ico")} Generate</button>`);
+}
+function exportTrackerBoard(acId){
+  const g=id=>document.getElementById(id);
+  const widthIn=parseInt((g("ob_w")||{}).value||"36",10)||36;
+  const prefill=(((g("ob_mode")||{}).value)||"blank")==="prefill";
+  closeModal();
+  const J=window.jspdf&&window.jspdf.jsPDF; if(!J){ toast("PDF engine offline \u2014 use browser Print","warn"); return; }
+  const a=byId(State.aircraft, acId); if(!a) return;
+  const ap=byId(State.programs, a.programId)||activeProgram();
+  const stages=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
+  const tasksOf=st=>State.tasks.filter(t=>t.stageId===st.id).sort((x,z)=>(x.seq||0)-(z.seq||0));
+  const smap={}; ((State.schedules[a.programId]||{}).taskSchedules||[]).forEach(s=>smap[s.taskId]=s);
+  const fmt=ms=>ms?new Date(ms).toLocaleDateString():"";
+  const skillLabel=s=>String(s||"").replace(/_/g," ").toLowerCase().replace(/\b\w/g,m=>m.toUpperCase());
+
+  // ---- geometry (points, 72pt = 1 inch) ----
+  const IN=72, widthPt=widthIn*IN, M=0.75*IN, CW=widthPt-2*M;
+  const rh=54, hh=46, sb=42, gr=58, titleH=212, footH=60;
+
+  // printed = pulled from the system · write = blank box for the pen
+  const cols=[
+    {k:"id",label:"ID",w:96,align:"c"}, {k:"task",label:"STATION / TASK",w:0,align:"l"},
+    {k:"skill",label:"SKILL",w:150,align:"l"}, {k:"plan",label:"PLAN h",w:80,align:"c"},
+    {k:"crew",label:"CREW min-max",w:120,align:"c"}, {k:"cc",label:"CURE/COOL h",w:120,align:"c"},
+    {k:"phase",label:"W / Cu / Co done",w:170,align:"l"}, {k:"assigned",label:"CREW USED",w:110,align:"c"},
+    {k:"act",label:"ACTUAL h",w:120,align:"c"}, {k:"start",label:"START",w:150,align:"c"},
+    {k:"finish",label:"FINISH",w:150,align:"c"}, {k:"pct",label:"%",w:74,align:"c"},
+    {k:"by",label:"BY",w:110,align:"c"}, {k:"qa",label:"QA SIGN",w:120,align:"c"}, {k:"notes",label:"NOTES",w:320,align:"l"}
+  ];
+  const fixed=cols.reduce((s,c)=>s+c.w,0); cols.find(c=>c.k==="task").w=Math.max(300, CW-fixed);
+  let cxo=M; cols.forEach(c=>{ c.x=cxo; cxo+=c.w; });
+  const colX=k=>cols.find(c=>c.k===k).x, colW=k=>cols.find(c=>c.k===k).w;
+
+  // ---- total sheet height (grows with the task list) ----
+  let bodyH=hh; stages.forEach(st=>{ bodyH+=sb; bodyH+=(tasksOf(st).length||1)*rh; if(st.gated) bodyH+=gr; });
+  const totalH=M+titleH+bodyH+footH+M;
+  const port=totalH>=widthPt;
+  const doc=new J({unit:"pt", orientation:port?"portrait":"landscape", format:port?[widthPt,totalH]:[totalH,widthPt]});
+
+  const INK=[20,28,40], SUB=[110,122,138], LINE=[214,221,230], WLINE=[150,162,176], ACC=[42,104,182];
+  let y=M;
+
+  // ===== TITLE BLOCK =====
+  doc.setFillColor(15,22,32); doc.rect(M,y,CW,titleH-24,"F");
+  doc.setFont("helvetica","bold"); doc.setFontSize(15); doc.setTextColor(120,190,240);
+  doc.text((State.settings.appName||"CompositePlan Pro").toUpperCase()+"  \u2014  PROTOTYPE OPS BOARD", M+24, y+34);
+  doc.setFontSize(46); doc.setTextColor(255,255,255); doc.text(String(a.serialNumber||"\u2014"), M+24, y+92);
+  doc.setFont("helvetica","normal"); doc.setFontSize(17); doc.setTextColor(200,214,228);
+  doc.text([ap?ap.name:"", a.model||"", "Rev "+(a.buildRevision||"-")].filter(Boolean).join("   \u00b7   "), M+24, y+126);
+  doc.setFontSize(11); doc.setTextColor(150,168,186);
+  doc.text("Build ID: "+a.id+"   \u00b7   generated "+new Date().toLocaleString(), M+24, y+titleH-46);
+  // right-hand write-in header fields
+  const fx=M+CW-700; let fy=y+40; doc.setFontSize(15);
+  const fld=lab=>{ doc.setFont("helvetica","bold"); doc.setTextColor(230,238,246); doc.text(lab, fx, fy); doc.setDrawColor(120,140,160); doc.setLineWidth(1); doc.line(fx+160,fy+4,fx+660,fy+4); fy+=42; };
+  fld("BUILD START"); fld("TARGET DATE"); fld("LINE LEAD"); fld("SHEET      of");
+  // legend strip
+  const ly=y+titleH-24; doc.setFillColor(236,240,245); doc.rect(M,ly,CW,24,"F");
+  doc.setTextColor(70,84,100); doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  doc.text("HOW TO USE:  tick each phase as it finishes  \u00b7  write actual hours, crew used, start/finish dates & your initials  \u00b7  QA signs each task  \u00b7  gates need approval  \u00b7  return this sheet to the office for data entry.", M+16, ly+16);
+  y+=titleH;
+
+  // ===== COLUMN HEADER =====
+  doc.setFillColor(15,22,32); doc.rect(M,y,CW,hh,"F"); doc.setTextColor(230,238,246); doc.setFont("helvetica","bold"); doc.setFontSize(12);
+  cols.forEach(c=>{ const tx=c.align==="c"?c.x+c.w/2:c.x+8; doc.text(c.label, tx, y+hh/2+4, {align:c.align==="c"?"center":"left", maxWidth:c.w-10}); });
+  doc.setDrawColor(70,84,100); doc.setLineWidth(0.6); cols.forEach(c=>doc.line(c.x,y,c.x,y+hh)); doc.line(M+CW,y,M+CW,y+hh);
+  y+=hh;
+
+  const cbox=(x,cy,lab)=>{ const s=16; doc.setDrawColor.apply(doc,WLINE); doc.setLineWidth(1.2); doc.rect(x,cy-s/2,s,s); doc.setFont("helvetica","normal"); doc.setFontSize(10.5); doc.setTextColor.apply(doc,SUB); doc.text(lab,x+s+3,cy+3.5); };
+  const wln=(x,cy,w)=>{ doc.setDrawColor.apply(doc,WLINE); doc.setLineWidth(0.8); doc.line(x+6,cy,x+w-6,cy); };
+
+  // ===== ROWS =====
+  let zeb=false;
+  stages.forEach((st,si)=>{
+    doc.setFillColor.apply(doc,ACC); doc.rect(M,y,CW,sb,"F"); doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(15);
+    doc.text("STATION "+(st.sequence||si+1)+"   \u00b7   "+(st.name||""), M+14, y+sb/2+5);
+    if(st.gated){ doc.setFontSize(12); doc.setTextColor(255,225,180); doc.text("GATE STATION \u2014 approval required to proceed", M+CW-410, y+sb/2+5); }
+    y+=sb;
+    const list=tasksOf(st); (list.length?list:[null]).forEach(t=>{
+      if(zeb){ doc.setFillColor(246,248,251); doc.rect(M,y,CW,rh,"F"); } zeb=!zeb;
+      if(t){
+        doc.setFont("helvetica","bold"); doc.setFontSize(12); doc.setTextColor.apply(doc,SUB);
+        doc.text(String(t.wbsCode||""), colX("id")+colW("id")/2, y+rh/2+4, {align:"center"});
+        doc.setFontSize(14); doc.setTextColor.apply(doc,INK);
+        doc.text(String(t.name||""), colX("task")+8, y+rh/2+5, {maxWidth:colW("task")-14});
+        doc.setFont("helvetica","normal"); doc.setFontSize(11.5); doc.setTextColor.apply(doc,SUB);
+        doc.text(skillLabel(t.laborSkill), colX("skill")+8, y+rh/2+4, {maxWidth:colW("skill")-12});
+        doc.setFontSize(13); doc.setTextColor.apply(doc,INK);
+        doc.text(String(Math.round(t.plannedLaborHours||0)), colX("plan")+colW("plan")/2, y+rh/2+5, {align:"center"});
+        doc.text((t.minWorkers||1)+"-"+(t.maxWorkers||1), colX("crew")+colW("crew")/2, y+rh/2+5, {align:"center"});
+        doc.text(((t.curingDurationHrs||0)||"-")+" / "+((t.coolingDurationHrs||0)||"-"), colX("cc")+colW("cc")/2, y+rh/2+5, {align:"center"});
+        const py=y+rh/2, pxx=colX("phase")+10; cbox(pxx,py,"W"); cbox(pxx+52,py,"Cu"); cbox(pxx+108,py,"Co");
+        if(prefill){ const sc=smap[t.id]; doc.setFont("helvetica","normal"); doc.setFontSize(12); doc.setTextColor.apply(doc,INK);
+          if(t.assignedWorkers) doc.text(String(t.assignedWorkers), colX("assigned")+colW("assigned")/2, y+rh/2+5,{align:"center"});
+          if(t.actualLaborHours) doc.text(String(Math.round(t.actualLaborHours)), colX("act")+colW("act")/2, y+rh/2+5,{align:"center"});
+          if(sc){ doc.setFontSize(10.5); doc.text(fmt(sc.startMs), colX("start")+colW("start")/2, y+rh/2+5,{align:"center"}); doc.text(fmt(sc.finishMs), colX("finish")+colW("finish")/2, y+rh/2+5,{align:"center"}); }
+          if(t.percentComplete) doc.text(t.percentComplete+"%", colX("pct")+colW("pct")/2, y+rh/2+5,{align:"center"});
+        } else { ["assigned","act","start","finish","pct","by","qa"].forEach(k=>wln(colX(k),y+rh-14,colW(k))); }
+      }
+      doc.setDrawColor(210,218,228); doc.setLineWidth(0.6); cols.forEach(c=>doc.line(c.x,y,c.x,y+rh)); doc.line(M+CW,y,M+CW,y+rh);
+      doc.setDrawColor.apply(doc,LINE); doc.line(M,y+rh,M+CW,y+rh);
+      y+=rh;
+    });
+    if(st.gated){ doc.setFillColor(250,244,232); doc.rect(M,y,CW,gr,"F"); doc.setDrawColor(200,160,80); doc.setLineWidth(1.4); doc.rect(M,y,CW,gr);
+      doc.setTextColor(150,100,20); doc.setFont("helvetica","bold"); doc.setFontSize(15);
+      doc.text("GATE \u2014 "+(st.name||"")+":  review complete?", M+16, y+gr/2+5);
+      const bx=M+CW-1020; cbox(bx,y+gr/2,"APPROVED"); cbox(bx+160,y+gr/2,"REJECTED");
+      doc.setFont("helvetica","bold"); doc.setTextColor(150,100,20); doc.setFontSize(13);
+      doc.text("SIGN", bx+330, y+gr/2+4); wln(bx+375,y+gr/2+6,260);
+      doc.text("DATE", bx+660, y+gr/2+4); wln(bx+705,y+gr/2+6,300);
+      y+=gr;
+    }
+  });
+
+  doc.setDrawColor.apply(doc,LINE); doc.setLineWidth(1); doc.line(M,y+8,M+CW,y+8);
+  doc.setFont("helvetica","normal"); doc.setFontSize(11); doc.setTextColor.apply(doc,SUB);
+  doc.text((State.settings.companyName||State.settings.appName||"CompositePlan Pro")+"   \u00b7   "+(ap?ap.name:"")+"   \u00b7   "+(a.serialNumber||"")+'   \u00b7   print at 100% on the '+widthIn+'" roll', M, y+30);
+
+  doc.save(("ops-board-"+(a.serialNumber||"build")+"-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_"));
+  toast("Ops board generated \u2014 print at 100% on the "+widthIn+'" plotter');
+}
+
+/* ============================================================================
+   WALL GANTT  —  crisp vector production schedule for the shop-floor wall.
+   Exact A4/A3 (portrait or landscape), multi-page with the task column & date
+   axis repeated on every page. By-station (at-a-glance) or by-task (detailed).
+   Bars come from the resource-constrained schedule; today line + critical path.
+   ==========================================================================*/
+function ganttPdfModal(acId){
+  const ap=activeProgram(); if(!ap){ toast("No active program","warn"); return; }
+  const active= acId? byId(State.aircraft,acId) : (State.ui.activeAircraft? byId(State.aircraft,State.ui.activeAircraft):null);
+  const models=[...new Set(State.aircraft.filter(a=>a.programId===ap.id).map(a=>a.model).filter(Boolean))];
+  const selAc= active? "selected":"";
+  openModal("Print Gantt", `
+    <p class="muted" style="margin-top:0">A production schedule to track ${active?("build <b>"+esc(active.serialNumber)+"</b>"):"the program"} \u2014 pin it up alongside the ops board.</p>
+    <div class="frow">
+      <div class="field"><label>Scope</label><select id="gp_scope">
+        ${active?`<option value="aircraft" selected>This build \u2014 ${esc(active.serialNumber)}</option>`:""}
+        <option value="program" ${active?"":"selected"}>Whole program \u2014 ${esc(ap.name)}</option>
+        ${models.map(m=>`<option value="model:${esc(m)}">Model \u2014 ${esc(m)}</option>`).join("")}
+      </select></div>
+      <div class="field"><label>Detail</label><select id="gp_rows"><option value="station" selected>By station (at a glance)</option><option value="task">By task (detailed)</option><option value="grid">Blank grid \u2014 hourly / 30-min boxes (write-in)</option></select></div>
+    </div>
+    <div class="frow">
+      <div class="field"><label>Time box <span class="muted" style="font-weight:400">(blank grid)</span></label><select id="gp_slot"><option value="30" selected>30 minutes</option><option value="60">Hourly</option></select></div>
+      <div class="field"><label>Working days <span class="muted" style="font-weight:400">(blank grid)</span></label><input id="gp_days" type="number" min="1" max="60" value="${(function(){let d=10; if(active&&active.plannedStartMs&&active.plannedFinishMs&&active.plannedFinishMs>active.plannedStartMs) d=Math.min(60,Math.ceil((active.plannedFinishMs-active.plannedStartMs)/DAY)+1); return d;})()}"></div>
+    </div>
+    <div class="frow">
+      <div class="field"><label>Paper</label><select id="gp_paper">
+        <option value="a4">A4</option><option value="a3" selected>A3</option>
+        <option value="roll36">36 inch roll</option><option value="roll24">24 inch roll</option><option value="roll42">42 inch roll</option>
+      </select></div>
+      <div class="field"><label>Orientation <span class="muted" style="font-weight:400">(A4/A3)</span></label><select id="gp_orient"><option value="landscape" selected>Landscape</option><option value="portrait">Portrait</option></select></div>
+    </div>
+    <div class="minihint">Crisp vector PDF at exact size \u2014 print at 100%. Roll sizes make one long strip (roll width = height); A4/A3 flow onto extra pages if the list is long.</div>
+  `, `<button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="gantt-pdf-go"${active?` data-id="${active.id}"`:""}>${icon("printer","ico")} Generate</button>`);
+}
+/* Blank hourly / 30-min box grid (same box style as the schedule print, but empty)
+   for manual tracking next to the ops board. A4/A3 paginate days across sheets;
+   roll sizes make one long strip. Columns = working-hour boxes from the calendar. */
+function exportGridBoard(o){
+  const J=window.jspdf&&window.jspdf.jsPDF; if(!J){ toast("PDF engine offline","warn"); return; }
+  const ap=activeProgram(); if(!ap) return;
+  const a= byId(State.aircraft,o.acId) || (State.ui.activeAircraft?byId(State.aircraft,State.ui.activeAircraft):null) || State.aircraft.find(x=>x.programId===ap.id);
+  if(!a){ toast("Open a build first","warn"); return; }
+  const slot=o.slot===60?60:30, paper=o.paper||"a3", orient=o.orient||"landscape";
+  const cal= byId(State.calendars, ap.defaultCalendarId) || State.calendars[0];
+  let ds=8*60, de=17*60; if(cal&&cal.shifts&&cal.shifts.length){ ds=Math.min.apply(null,cal.shifts.map(s=>s.startMin)); de=Math.max.apply(null,cal.shifts.map(s=>s.endMin)); } if(!(de>ds)){ ds=480; de=1020; }
+  const breaks=[]; if(cal&&cal.shifts) cal.shifts.forEach(sh=>{ if(sh.breakStartMin!=null&&sh.breakEndMin!=null&&sh.breakEndMin>sh.breakStartMin) breaks.push([sh.breakStartMin,sh.breakEndMin]); });
+  const isBreak=m=> breaks.some(p=> m<p[1]&&(m+slot)>p[0]);
+  const wd=(cal&&cal.workingDays)||[true,true,true,true,true,true,true];
+  const hol=(cal&&cal.holidays)||[]; const isHol=ms=>{const x=new Date(ms); return hol.some(h=>{const d=new Date(h); return d.getFullYear()===x.getFullYear()&&d.getMonth()===x.getMonth()&&d.getDate()===x.getDate();});};
+  const want=Math.max(1,Math.min(60,o.days||10));
+  let s0= a.plannedStartMs? new Date(a.plannedStartMs): new Date(); s0.setHours(0,0,0,0);
+  const days=[]; let ms=s0.getTime(),guard=0; while(days.length<want&&guard<600){ const dow=new Date(ms).getDay(); if(wd[dow]!==false&&!isHol(ms)) days.push(ms); ms+=DAY; guard++; }
+  const slots=[]; for(let m=ds;m<de;m+=slot) slots.push(m);
+  const cols=[]; days.forEach(d=> slots.forEach((m,i)=> cols.push({day:d,min:m,dstart:i===0,brk:isBreak(m)})));
+  const stages=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
+  const rows=[]; stages.forEach(st=>{ rows.push({stg:1,label:"STATION "+(st.sequence)+"  \u00b7  "+(st.name||"")}); const tk=State.tasks.filter(t=>t.stageId===st.id).sort((x,z)=>(x.seq||0)-(z.seq||0)); (tk.length?tk:[null]).forEach(t=>rows.push({t})); });
+  if(!rows.length){ toast("No stations to grid","warn"); return; }
+
+  const hm=m=>String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0");
+  const dlab=ms=>new Date(ms).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"});
+  const M=22, headerH=46, dayH=15, timeH=24, footerH=16;
+  const LC=[{k:"id",label:"ID",w:42},{k:"task",label:"TASK",w:150},{k:"crew",label:"CREW",w:40},{k:"plan",label:"PLAN h",w:44}];
+  const leftW=LC.reduce((s,c)=>s+c.w,0);
+  const colW= slot===60?26:16;
+  const isRoll=String(paper).indexOf("roll")===0;
+  let doc,W,H;
+  if(isRoll){ const rin=parseInt(String(paper).replace("roll",""),10)||36; H=rin*72; W=M+leftW+cols.length*colW+M; const port=H>=W; doc=new J({unit:"pt",orientation:port?"portrait":"landscape",format:port?[W,H]:[H,W]}); }
+  else { doc=new J({unit:"pt",orientation:orient==="landscape"?"landscape":"portrait",format:paper}); }
+  W=doc.internal.pageSize.getWidth(); H=doc.internal.pageSize.getHeight();
+  const gridTop=headerH+dayH+timeH, gridBot=H-M-footerH, gx0=M+leftW;
+  const rowH=Math.min(20, Math.max(9, Math.floor((gridBot-gridTop)/Math.max(1,rows.length))));
+  const colsPerPage= isRoll? cols.length : Math.max(1, Math.floor((W-M-gx0)/colW));
+  const colPages= Math.max(1,Math.ceil(cols.length/colsPerPage));
+  const C={ink:[28,38,52],sub:[110,125,140],line:[200,208,218],grid:[226,231,238],brk:[224,228,233],box:[120,134,150]};
+
+  function page(cs,ce,pi){
+    doc.setFillColor(15,22,32); doc.rect(0,0,W,headerH,"F");
+    doc.setFont("helvetica","bold"); doc.setTextColor(255,255,255); doc.setFontSize(13); doc.text("Ops Grid \u2014 "+(a.serialNumber||""), M, 20);
+    doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor(150,190,235); doc.text((ap?ap.name:"")+(a.model?("  \u00b7  "+a.model):"")+"   \u00b7   "+slot+"-min boxes   \u00b7   tick each block as it is worked", M, 34);
+    doc.setTextColor(180,195,212); doc.setFontSize(8.5); doc.text((State.settings.appName||"CompositePlan Pro"),W-M,17,{align:"right"}); doc.text("Sheet "+pi+" / "+colPages,W-M,32,{align:"right"});
+    doc.setFillColor(233,238,244); doc.rect(M,headerH,leftW,dayH+timeH,"F"); doc.setTextColor.apply(doc,C.sub); doc.setFont("helvetica","bold"); doc.setFontSize(8.5);
+    let lx=M; LC.forEach(c=>{ doc.text(c.label, lx+3, headerH+timeH+6); lx+=c.w; });
+    let i=cs; while(i<ce){ let j=i; while(j<ce && cols[j].day===cols[i].day) j++; const x0=gx0+(i-cs)*colW, x1=gx0+(j-cs)*colW;
+      doc.setFillColor(219,227,238); doc.rect(x0,headerH,x1-x0,dayH,"F"); doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(0.6); doc.rect(x0,headerH,x1-x0,dayH);
+      doc.setTextColor(40,60,90); doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.text(dlab(cols[i].day),(x0+x1)/2,headerH+11,{align:"center",maxWidth:x1-x0-2}); i=j; }
+    doc.setFillColor(244,247,250); doc.rect(gx0,headerH+dayH,(ce-cs)*colW,timeH,"F");
+    for(let k=cs;k<ce;k++){ const x=gx0+(k-cs)*colW, c=cols[k];
+      doc.setDrawColor.apply(doc, c.dstart?C.line:C.grid); doc.setLineWidth(c.dstart?0.8:0.4); doc.line(x,headerH+dayH,x,gridBot);
+      if(c.min%60===0){ doc.setTextColor.apply(doc,C.sub); doc.setFont("helvetica","normal"); doc.setFontSize(6.5); doc.text(hm(c.min), x+colW/2+2, gridTop-3, {angle:90}); } }
+    doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(0.8); doc.line(gx0+(ce-cs)*colW,headerH+dayH,gx0+(ce-cs)*colW,gridBot); doc.line(gx0,gridTop,gx0+(ce-cs)*colW,gridTop);
+    let lvx=M; LC.forEach(c=>{ doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(0.5); doc.line(lvx,headerH,lvx,gridBot); lvx+=c.w; }); doc.line(gx0,headerH,gx0,gridBot);
+    let ry=gridTop;
+    rows.forEach(r=>{
+      if(r.stg){ doc.setFillColor(31,45,61); doc.rect(M,ry,W-2*M,rowH,"F"); doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(Math.min(9,rowH-6)); doc.text(r.label,M+4,ry+rowH-5,{maxWidth:W-2*M-8}); ry+=rowH; return; }
+      const t=r.t;
+      if(t){ doc.setTextColor.apply(doc,C.ink); doc.setFontSize(Math.min(8,rowH-6)); let lx2=M;
+        doc.setFont("helvetica","bold"); doc.text(String(t.wbsCode||""),lx2+3,ry+rowH-5,{maxWidth:LC[0].w-4}); lx2+=LC[0].w;
+        doc.setFont("helvetica","normal"); doc.text(String(t.name||""),lx2+3,ry+rowH-5,{maxWidth:LC[1].w-5}); lx2+=LC[1].w;
+        doc.text((t.minWorkers||1)+"-"+(t.maxWorkers||1),lx2+3,ry+rowH-5,{maxWidth:LC[2].w-4}); lx2+=LC[2].w;
+        doc.text(String(Math.round(t.plannedLaborHours||0)),lx2+3,ry+rowH-5,{maxWidth:LC[3].w-4}); }
+      for(let k=cs;k<ce;k++){ const x=gx0+(k-cs)*colW, c=cols[k];
+        if(c.brk){ doc.setFillColor.apply(doc,C.brk); doc.rect(x,ry,colW,rowH,"F"); }
+        else if(t){ const bs=Math.min(7,rowH-8,colW-8); if(bs>=4){ doc.setDrawColor.apply(doc,C.box); doc.setLineWidth(0.5); doc.rect(x+(colW-bs)/2,ry+(rowH-bs)/2,bs,bs); } } }
+      doc.setDrawColor.apply(doc,C.grid); doc.setLineWidth(0.4); doc.line(M,ry+rowH,gx0+(ce-cs)*colW,ry+rowH);
+      for(let k=cs;k<=ce;k++){ const x=gx0+(k-cs)*colW, c=cols[k]; doc.setDrawColor.apply(doc,(c&&c.dstart)?C.line:C.grid); doc.setLineWidth((c&&c.dstart)?0.8:0.3); doc.line(x,ry,x,ry+rowH); }
+      ry+=rowH;
+    });
+    doc.setFont("helvetica","normal"); doc.setFontSize(8); doc.setTextColor.apply(doc,C.sub); doc.text((State.settings.companyName||State.settings.appName||"CompositePlan Pro")+"   \u00b7   "+(a.serialNumber||"")+"   \u00b7   blank ops grid \u2014 shaded = break \u2014 print at 100%", M, H-M-3);
+  }
+  for(let p=0;p<colPages;p++){ if(p>0) doc.addPage(); const cs=p*colsPerPage, ce=Math.min(cols.length,cs+colsPerPage); page(cs,ce,p+1); }
+  doc.save(("ops-grid-"+(a.serialNumber||"build")+"-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_"));
+  toast("Blank ops grid generated \u2014 "+slot+"-min boxes ("+(isRoll?(paper.replace("roll","")+'\" roll'):paper.toUpperCase())+")");
+}
+
+function exportGanttPDF(acIdArg){
+  const g=id=>document.getElementById(id);
+  const scopeSel=((g("gp_scope")||{}).value)||"program";
+  const rowsMode=((g("gp_rows")||{}).value)||"station";
+  const paper=((g("gp_paper")||{}).value)||"a3";
+  const orient=((g("gp_orient")||{}).value)||"landscape";
+  const slot=parseInt((g("gp_slot")||{}).value||"30",10)||30;
+  const days=parseInt((g("gp_days")||{}).value||"10",10)||10;
+  closeModal();
+  if(rowsMode==="grid"){ return exportGridBoard({acId:acIdArg, paper, orient, slot, days}); }
+  const J=window.jspdf&&window.jspdf.jsPDF; if(!J){ toast("PDF engine offline","warn"); return; }
+  const ap=activeProgram(); if(!ap) return;
+  let scope="program", model=null, acId=null;
+  if(scopeSel==="aircraft"){ scope="aircraft"; acId=acIdArg||State.ui.activeAircraft; }
+  else if(scopeSel.indexOf("model:")===0){ scope="model"; model=scopeSel.slice(6); }
+  let acs= scope==="program" ? State.aircraft.filter(a=>a.programId===ap.id) : fleetScopeAircraft(scope, model, acId);
+  acs=acs.slice().sort((x,z)=>(x.buildSeq||0)-(z.buildSeq||0)||String(x.serialNumber).localeCompare(String(z.serialNumber),undefined,{numeric:true}));
+  const smap={}; [...new Set(acs.map(a=>a.programId))].forEach(pid=>((State.schedules[pid]||{}).taskSchedules||[]).forEach(s=>smap[s.taskId]=s));
+  const wOfp=(t)=>{ const lh=(t.plannedLaborHours||0); if(lh>0) return lh; const fx=(t.fixedDurationHrs||0)*(t.assignedWorkers||1); return fx>0?fx:1; };
+
+  const rows=[]; let t0=Infinity, t1=-Infinity;
+  acs.forEach(a=>{
+    const stages=State.stages.filter(s=>s.aircraftId===a.id).sort((x,z)=>x.sequence-z.sequence);
+    const has=stages.some(st=>State.tasks.some(t=>t.stageId===st.id && smap[t.id])); if(!has) return;
+    if(acs.length>1) rows.push({type:"group", label:a.serialNumber+(a.model?("   \u00b7   "+a.model):"")});
+    stages.forEach(st=>{
+      const tks=State.tasks.filter(t=>t.stageId===st.id).map(t=>({t,s:smap[t.id]})).filter(o=>o.s); if(!tks.length) return;
+      if(rowsMode==="station"){
+        const start=Math.min.apply(null,tks.map(o=>o.s.startMs)), fin=Math.max.apply(null,tks.map(o=>o.s.finishMs));
+        const sw=tks.reduce((x,o)=>x+wOfp(o.t),0); const pct= sw? Math.round(tks.reduce((x,o)=>x+wOfp(o.t)*(o.t.percentComplete||0),0)/sw):0;
+        rows.push({type:"bar", label:st.name, start, fin, pct, crit:tks.some(o=>o.s.onCriticalPath), gated:!!st.gated});
+        t0=Math.min(t0,start); t1=Math.max(t1,fin);
+      } else {
+        rows.push({type:"sub", label:st.name});
+        tks.forEach(o=>{ const s=o.s; rows.push({type:"bar", label:"   "+o.t.name, start:s.startMs, fin:s.finishMs, pct:o.t.percentComplete||0, crit:s.onCriticalPath, work:s.workMin, cure:s.cureMin, cool:s.coolMin, phase:true});
+          t0=Math.min(t0,s.startMs); t1=Math.max(t1,s.finishMs); });
+      }
+    });
+  });
+  if(!rows.length || !isFinite(t0)){ toast("Nothing scheduled to print \u2014 run the schedule first","warn"); return; }
+  const pad=((t1-t0)*0.02)||DAY; t0-=pad; t1+=pad;
+
+  const M=26, headerH=56, axisH=26, footerH=26;
+  const isRoll=String(paper).indexOf("roll")===0;
+  let doc,W,H,nameW;
+  if(isRoll){
+    const rin=parseInt(String(paper).replace("roll",""),10)||36; H=rin*72; nameW=210;
+    const spanDays=(t1-t0)/DAY, ppd= spanDays<=30?48:(spanDays<=120?18:8);
+    const timelineW=Math.min(6000, Math.max(700, Math.round(spanDays*ppd))); W=M+nameW+timelineW+M;
+    const port=H>=W; doc=new J({unit:"pt", orientation:port?"portrait":"landscape", format:port?[W,H]:[H,W]});
+    W=doc.internal.pageSize.getWidth(); H=doc.internal.pageSize.getHeight();
+  } else {
+    nameW= orient==="landscape"?210:150; doc=new J({unit:"pt", orientation:orient==="landscape"?"landscape":"portrait", format:paper});
+    W=doc.internal.pageSize.getWidth(); H=doc.internal.pageSize.getHeight();
+  }
+  const tlX=M+nameW, tlW=W-M-tlX;
+  const bodyTop=headerH+axisH, bodyBot=H-M-footerH;
+  let rowH= rowsMode==="station"?22:16;
+  if(isRoll) rowH=Math.min(rowH, Math.max(9, Math.floor((bodyBot-bodyTop)/Math.max(1,rows.length))));
+  const perPage= isRoll? rows.length : Math.max(1,Math.floor((bodyBot-bodyTop)/rowH));
+  const xOf=ms=> tlX+(ms-t0)/(t1-t0)*tlW;
+  const C={ink:[28,38,52],sub:[110,125,140],line:[224,230,238],grid:[236,240,245],accent:[42,104,182],green:[22,140,70],amber:[214,158,58],orange:[210,110,40],grey:[176,186,198],red:[206,42,42]};
+  const spanD=(t1-t0)/DAY; let step; if(spanD<=24) step=DAY; else if(spanD<=110) step=7*DAY; else step=null;
+  const md=ms=>{const d=new Date(ms);return (d.getMonth()+1)+"/"+d.getDate();};
+  const ml=ms=>{const d=new Date(ms);return d.toLocaleString(undefined,{month:"short"})+" "+String(d.getFullYear()).slice(2);};
+  const TK=(()=>{ const arr=[]; if(step){ let s=Math.ceil(t0/step)*step; for(let x=s;x<=t1;x+=step) arr.push(x); } else { const d=new Date(t0); d.setDate(1); d.setHours(0,0,0,0); let ms=d.getTime(); while(ms<=t1){ arr.push(ms); const nd=new Date(ms); nd.setMonth(nd.getMonth()+1); ms=nd.getTime(); } } return arr; })();
+  const now=Date.now(), pages=Math.ceil(rows.length/perPage);
+
+  function chrome(pi){
+    doc.setFillColor(15,22,32); doc.rect(0,0,W,headerH,"F");
+    doc.setFont("helvetica","bold"); doc.setTextColor(255,255,255); doc.setFontSize(15); doc.text("Production Schedule", M, 25);
+    doc.setFont("helvetica","normal"); doc.setFontSize(9.5); doc.setTextColor(150,190,235);
+    const scopeLbl= scope==="aircraft"?("Tail "+((byId(State.aircraft,acId)||{}).serialNumber||"")):(scope==="model"?("Model "+model):ap.name);
+    doc.text(scopeLbl+"   \u00b7   "+new Date(t0).toLocaleDateString()+" \u2013 "+new Date(t1).toLocaleDateString(), M, 41);
+    doc.setTextColor(180,195,212); doc.setFontSize(9); doc.text((State.settings.appName||"CompositePlan Pro"), W-M, 21, {align:"right"}); doc.text("Page "+pi+" / "+pages, W-M, 39, {align:"right"});
+    doc.setFillColor(244,247,250); doc.rect(0,headerH,W,axisH,"F"); doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(1); doc.line(0,headerH+axisH,W,headerH+axisH);
+    doc.setFont("helvetica","bold"); doc.setFontSize(9); doc.setTextColor.apply(doc,C.sub); doc.text("STATION / TASK", M, headerH+16);
+    doc.setFont("helvetica","normal"); doc.setFontSize(8);
+    TK.forEach(ms=>{ const x=xOf(ms); if(x<tlX-1||x>W-M+1) return; doc.setDrawColor.apply(doc,C.grid); doc.setLineWidth(0.5); doc.line(x,headerH+axisH,x,bodyBot); doc.setTextColor.apply(doc,C.sub); doc.text(step?md(ms):ml(ms), x+2, headerH+16); });
+    if(now>=t0&&now<=t1){ const x=xOf(now); doc.setDrawColor.apply(doc,C.red); doc.setLineWidth(1); doc.setLineDashPattern&&doc.setLineDashPattern([3,2],0); doc.line(x,headerH+axisH,x,bodyBot); doc.setLineDashPattern&&doc.setLineDashPattern([],0); doc.setFontSize(7.5); doc.setTextColor.apply(doc,C.red); doc.text("TODAY", x+2, headerH+axisH+8); }
+    doc.setDrawColor.apply(doc,C.line); doc.setLineWidth(1); doc.line(tlX,headerH,tlX,bodyBot);
+    const ly=H-M-6; let lx=M; doc.setFont("helvetica","normal"); doc.setFontSize(8);
+    const leg=(col,txt)=>{ doc.setFillColor.apply(doc,col); doc.rect(lx,ly-7,10,7,"F"); doc.setTextColor.apply(doc,C.sub); doc.text(txt,lx+13,ly-1); lx+=13+doc.getTextWidth(txt)+14; };
+    if(rowsMode==="task"){ leg(C.accent,"Work"); leg(C.orange,"Cure"); leg(C.amber,"Cool"); } else { leg(C.green,"Complete"); leg(C.accent,"In progress"); leg(C.grey,"Not started"); }
+    doc.setDrawColor.apply(doc,C.red); doc.setLineWidth(1); doc.line(lx,ly-4,lx+12,ly-4); doc.setTextColor.apply(doc,C.sub); doc.text("Critical / Today", lx+16,ly-1);
+  }
+
+  for(let pi=0; pi<pages; pi++){
+    if(pi>0) doc.addPage();
+    chrome(pi+1);
+    let ry=bodyTop;
+    rows.slice(pi*perPage,(pi+1)*perPage).forEach(r=>{
+      if(r.type==="group"){ doc.setFillColor(15,22,32); doc.rect(M,ry,W-2*M,rowH,"F"); doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(9.5); doc.text(r.label,M+6,ry+rowH-6); ry+=rowH; return; }
+      if(r.type==="sub"){ doc.setFillColor(238,242,246); doc.rect(M,ry,W-2*M,rowH,"F"); doc.setTextColor.apply(doc,C.sub); doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.text(r.label,M+6,ry+rowH-5); ry+=rowH; return; }
+      doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor.apply(doc,C.ink); doc.text(String(r.label),M+6,ry+rowH-6,{maxWidth:nameW-10});
+      doc.setDrawColor.apply(doc,C.grid); doc.setLineWidth(0.4); doc.line(tlX,ry+rowH,W-M,ry+rowH);
+      const bx=xOf(r.start), bw=Math.max(2,xOf(r.fin)-xOf(r.start)), by=ry+3, bh=rowH-6;
+      if(r.phase){ const tot=(r.work||0)+(r.cure||0)+(r.cool||0)||1; let x=bx;
+        const seg=(m,col)=>{ if(m<=0) return; const w=bw*m/tot; doc.setFillColor.apply(doc,col); doc.rect(x,by,Math.max(1,w),bh,"F"); x+=w; };
+        seg(r.work,C.accent); seg(r.cure,C.orange); seg(r.cool,C.amber);
+        if(r.crit){ doc.setDrawColor.apply(doc,C.red); doc.setLineWidth(1); doc.rect(bx,by,bw,bh); }
+      } else {
+        doc.setFillColor(228,233,240); doc.rect(bx,by,bw,bh,"F");
+        if(r.pct>=100){ doc.setFillColor.apply(doc,C.green); doc.rect(bx,by,bw,bh,"F"); }
+        else if(r.pct>0){ doc.setFillColor.apply(doc,C.accent); doc.rect(bx,by,Math.max(1,bw*r.pct/100),bh,"F"); doc.setDrawColor.apply(doc,C.accent); doc.setLineWidth(0.6); doc.rect(bx,by,bw,bh); }
+        else { doc.setFillColor.apply(doc,C.grey); doc.rect(bx,by,bw,bh,"F"); }
+        if(r.gated){ doc.setFillColor.apply(doc,C.amber); doc.triangle(xOf(r.fin),by-1,xOf(r.fin)-4,by-7,xOf(r.fin)+4,by-7,"F"); }
+        if(r.crit){ doc.setDrawColor.apply(doc,C.red); doc.setLineWidth(1); doc.rect(bx,by,bw,bh); }
+        if(bw>24){ doc.setFontSize(7); doc.setTextColor.apply(doc,C.ink); doc.text((r.pct||0)+"%", bx+bw+3, ry+rowH-7); }
+      }
+      ry+=rowH;
+    });
+  }
+  doc.save(("gantt-"+(scope==="aircraft"?((byId(State.aircraft,acId)||{}).serialNumber||"tail"):ap.code)+"-"+isoStamp()+".pdf").replace(/[^a-z0-9.\-]/gi,"_"));
+  toast("Gantt generated \u2014 print at 100% ("+(isRoll?(paper.replace("roll","")+'\" roll'):(paper.toUpperCase()+" "+orient))+")");
+}
+
 function exportPDF(kind, scopeOpt){
   const doc=pdfDoc();
   if(!doc){ toast("PDF engine offline \u2014 use your browser's Print \u2192 Save as PDF","warn"); return; }
@@ -4715,6 +5089,8 @@ document.addEventListener("click", (e)=>{
     case "gantt-actual": State.ui.ganttShowActual=(State.ui.ganttShowActual===false); persist(); render(); break;
     case "gantt-png": Gantt2.exportPNG(); break;
     case "gantt-print": printModal(); break;
+    case "gantt-board": ganttPdfModal(id); break;
+    case "gantt-pdf-go": exportGanttPDF(id); break;
     case "ci-start": ciStart(); break;
     case "ci-pause": ciClose(id,false); break;
     case "ci-complete": ciClose(id,true); break;
@@ -4743,6 +5119,8 @@ document.addEventListener("click", (e)=>{
     case "dup-aircraft": dupAircraft(id); break;
     case "copy-build": copyBuildModal(id); break;
     case "copy-build-go": copyBuildGo(id); break;
+    case "tracker-board": trackerBoardModal(id); break;
+    case "tracker-board-go": exportTrackerBoard(id); break;
     case "dup-task": dupTask(id); break;
     case "dup-labor": dupLabor(id); break;
     case "dup-equip": dupEquip(id); break;
